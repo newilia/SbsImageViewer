@@ -13,6 +13,7 @@ import ctypes
 import argparse
 import logging
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -24,6 +25,9 @@ try:
     HAS_SEND2TRASH = True
 except ImportError:
     HAS_SEND2TRASH = False
+
+# Файл конфигурации
+CONFIG_FILE = Path(__file__).parent / "vr_viewer_settings.json"
 
 import numpy as np
 from PIL import Image
@@ -285,13 +289,16 @@ class VRStereoViewer:
         self.view_configs = []
         self.render_target_size = None
         
-        # Параметры отображения
-        self.quad_distance = 2.0  # Расстояние до прямоугольника в метрах
-        self.quad_scale = 1.0  # Масштаб прямоугольника (угловой размер)
+        # Параметры отображения (загружаем из конфига)
+        settings = self.load_settings()
+        self.quad_distance = settings.get("distance", 2.0)
+        self.quad_scale = settings.get("scale", 1.0)
         self.base_size = 1.0  # Базовый физический размер при расстоянии 1м
         self.distance_texture: Optional[int] = None
         self.distance_aspect: float = 1.0
         self.head_height: Optional[float] = None  # Высота головы (центр между глазами)
+        
+        log.info(f"Загружены настройки: расстояние={self.quad_distance:.1f}м, масштаб={self.quad_scale:.2f}")
         
     def load_images(self):
         """Загрузка всех изображений"""
@@ -1076,6 +1083,28 @@ class VRStereoViewer:
         if events_processed > 0:
             log.debug(f"  Обработано событий: {events_processed}")
                 
+    def load_settings(self) -> dict:
+        """Загрузка настроек из файла"""
+        try:
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            log.debug(f"Не удалось загрузить настройки: {e}")
+        return {}
+    
+    def save_settings(self):
+        """Сохранение настроек в файл"""
+        try:
+            settings = {
+                "distance": self.quad_distance,
+                "scale": self.quad_scale
+            }
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            log.debug(f"Не удалось сохранить настройки: {e}")
+    
     def next_image(self):
         """Переход к следующему изображению"""
         if self.images and len(self.images) > 1:
@@ -1339,19 +1368,23 @@ class VRStereoViewer:
                     elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD or key == glfw.KEY_D:
                         self.quad_scale = min(5.0, self.quad_scale * 1.1)
                         log.info(f"  Угловой размер: {self.quad_scale:.2f}")
+                        self.save_settings()
                     elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT or key == glfw.KEY_A:
                         self.quad_scale = max(0.1, self.quad_scale / 1.1)
                         log.info(f"  Угловой размер: {self.quad_scale:.2f}")
-                    elif key == glfw.KEY_S:
+                        self.save_settings()
+                    elif key == glfw.KEY_W:
                         # Логарифмическое увеличение расстояния (дальше)
                         self.quad_distance = min(50.0, self.quad_distance * 1.15)
                         self.update_distance_texture()
                         log.info(f"  Расстояние: {self.quad_distance:.1f} м")
-                    elif key == glfw.KEY_W:
+                        self.save_settings()
+                    elif key == glfw.KEY_S:
                         # Логарифмическое уменьшение расстояния (ближе)
                         self.quad_distance = max(0.3, self.quad_distance / 1.15)
                         self.update_distance_texture()
                         log.info(f"  Расстояние: {self.quad_distance:.1f} м")
+                        self.save_settings()
                     elif key == glfw.KEY_R:
                         # Сброс высоты головы (перецентровка)
                         self.head_height = None
