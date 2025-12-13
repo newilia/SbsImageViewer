@@ -5,4 +5,5 @@ Pillow>=10.0.0
 numpy>=1.24.0
 glfw>=2.6.0
 tkinterdnd2>=0.3.0
+send2trash>=1.8.0
 

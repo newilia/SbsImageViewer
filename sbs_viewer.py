@@ -19,6 +19,12 @@ from typing import Optional, List, Tuple
 import tkinter as tk
 from tkinter import filedialog
 
+try:
+    from send2trash import send2trash
+    HAS_SEND2TRASH = True
+except ImportError:
+    HAS_SEND2TRASH = False
+
 import numpy as np
 from PIL import Image
 
@@ -100,10 +106,11 @@ from linear import Matrix4x4f
 class StereoImage:
     """Класс для хранения стереопары изображений"""
     
-    def __init__(self, left: np.ndarray, right: np.ndarray, name: str = ""):
+    def __init__(self, left: np.ndarray, right: np.ndarray, name: str = "", path: str = ""):
         self.left = left
         self.right = right
         self.name = name
+        self.path = path  # Полный путь к файлу
         self.left_texture: Optional[int] = None
         self.right_texture: Optional[int] = None
         self.name_texture: Optional[int] = None
@@ -122,7 +129,7 @@ class StereoImage:
         left = np.array(left_img, dtype=np.uint8)
         right = np.array(right_img, dtype=np.uint8)
         
-        return cls(left, right, Path(image_path).name)
+        return cls(left, right, Path(image_path).name, os.path.abspath(image_path))
     
     @classmethod
     def from_separate_files(cls, left_path: str, right_path: str) -> 'StereoImage':
@@ -134,7 +141,7 @@ class StereoImage:
         right = np.array(right_img, dtype=np.uint8)
         
         name = f"{Path(left_path).stem} / {Path(right_path).stem}"
-        return cls(left, right, name)
+        return cls(left, right, name, os.path.abspath(left_path))
     
     def create_textures(self):
         """Создание OpenGL текстур"""
@@ -284,6 +291,7 @@ class VRStereoViewer:
         self.base_size = 1.0  # Базовый физический размер при расстоянии 1м
         self.distance_texture: Optional[int] = None
         self.distance_aspect: float = 1.0
+        self.head_height: Optional[float] = None  # Высота головы (центр между глазами)
         
     def load_images(self):
         """Загрузка всех изображений"""
@@ -818,8 +826,11 @@ class VRStereoViewer:
         
         # 4. Матрица модели - прямоугольник перед пользователем
         # Позиция: перед пользователем на расстоянии quad_distance
-        # Y = высота глаз пользователя (берём из позиции камеры)
-        eye_height = pose.position.y
+        # Y = фиксированная высота головы (одинаковая для обоих глаз!)
+        # При первом кадре запоминаем высоту
+        if self.head_height is None:
+            self.head_height = pose.position.y
+        eye_height = self.head_height
         quad_pos = xr.Vector3f(0, eye_height, -self.quad_distance)
         quad_rot = xr.Quaternionf(0, 0, 0, 1)  # Без вращения
         # Физический размер = base_size * quad_scale * расстояние (для сохранения углового размера)
@@ -907,9 +918,7 @@ class VRStereoViewer:
     def render_frame(self):
         """Рендеринг одного кадра"""
         # Ожидаем кадр (это блокирующий вызов!)
-        log.debug("  wait_frame...")
         frame_state = xr.wait_frame(self.session)
-        log.debug(f"  wait_frame OK, should_render={frame_state.should_render}")
         
         # Начинаем кадр
         xr.begin_frame(self.session)
@@ -1079,6 +1088,129 @@ class VRStereoViewer:
             self.current_index = (self.current_index - 1) % len(self.images)
             log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
     
+    def delete_current_image(self):
+        """Удаление текущего изображения в корзину"""
+        log.info("Попытка удаления изображения...")
+        
+        if not self.images:
+            log.warning("Нет изображений для удаления")
+            return
+        
+        if not HAS_SEND2TRASH:
+            log.error("send2trash не установлен! Выполните: pip install send2trash")
+            return
+        
+        current_image = self.images[self.current_index]
+        image_path = current_image.path  # Используем сохранённый путь
+        
+        log.info(f"Удаление: {current_image.name}")
+        log.info(f"Путь: {image_path}")
+        
+        if not image_path:
+            log.error("Путь к файлу не сохранён в объекте изображения")
+            return
+            
+        if not os.path.exists(image_path):
+            log.error(f"Файл не существует: {image_path}")
+            return
+        
+        try:
+            # Удаляем текстуры
+            current_image.delete_textures()
+            
+            # Отправляем в корзину
+            send2trash(image_path)
+            log.info(f"🗑️ Удалено в корзину: {current_image.name}")
+            
+            # Удаляем из списков
+            self.images.pop(self.current_index)
+            
+            # Удаляем из image_paths
+            norm_path = os.path.normpath(image_path)
+            self.image_paths = [p for p in self.image_paths if os.path.normpath(p) != norm_path]
+            
+            # Корректируем индекс
+            if self.images:
+                if self.current_index >= len(self.images):
+                    self.current_index = len(self.images) - 1
+                log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
+            else:
+                log.info("Все изображения удалены")
+                
+        except Exception as e:
+            log.error(f"Ошибка удаления: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+    
+    def refresh_images(self):
+        """Обновление списка файлов из текущей директории"""
+        if not self.image_paths:
+            log.warning("Нет пути для обновления")
+            return
+        
+        # Определяем папку из первого пути
+        first_path = self.image_paths[0]
+        if os.path.isfile(first_path):
+            folder = os.path.dirname(first_path)
+        else:
+            folder = first_path
+        
+        if not folder or not os.path.isdir(folder):
+            log.warning(f"Папка не найдена: {folder}")
+            return
+        
+        # Запоминаем текущее изображение
+        current_name = self.images[self.current_index].name if self.images else None
+        
+        # Удаляем старые текстуры
+        for img in self.images:
+            img.delete_textures()
+        self.images.clear()
+        
+        # Сканируем папку заново
+        new_paths = find_images(folder)
+        if not new_paths:
+            log.warning(f"Изображения не найдены в: {folder}")
+            return
+        
+        self.image_paths = new_paths
+        log.info(f"🔄 Обновлено: найдено {len(new_paths)} файлов в {folder}")
+        
+        # Загружаем изображения
+        for path in self.image_paths:
+            try:
+                if self.sbs_mode:
+                    img = StereoImage.from_sbs(path)
+                else:
+                    if '_left' in path.lower():
+                        right_path = path.lower().replace('_left', '_right')
+                        for orig_path in self.image_paths:
+                            if orig_path.lower() == right_path:
+                                img = StereoImage.from_separate_files(path, orig_path)
+                                break
+                        else:
+                            continue
+                    elif '_right' in path.lower():
+                        continue
+                    else:
+                        img = StereoImage.from_sbs(path)
+                
+                img.create_textures()
+                self.images.append(img)
+            except Exception as e:
+                log.debug(f"Ошибка загрузки {path}: {e}")
+        
+        # Восстанавливаем позицию на том же изображении если возможно
+        self.current_index = 0
+        if current_name:
+            for i, img in enumerate(self.images):
+                if img.name == current_name:
+                    self.current_index = i
+                    break
+        
+        if self.images:
+            log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
+    
     def add_images_from_paths(self, paths: List[str], replace: bool = False):
         """
         Добавление новых изображений в просмотрщик.
@@ -1200,26 +1332,36 @@ class VRStereoViewer:
                         self.open_files_dialog(replace=True)
                     elif key == glfw.KEY_F:
                         self.open_folder_dialog()
-                    elif key == glfw.KEY_RIGHT or key == glfw.KEY_D:
+                    elif key == glfw.KEY_RIGHT or key == glfw.KEY_E:
                         self.next_image()
-                    elif key == glfw.KEY_LEFT or key == glfw.KEY_A:
+                    elif key == glfw.KEY_LEFT or key == glfw.KEY_Q:
                         self.prev_image()
-                    elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD or key == glfw.KEY_W:
+                    elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD or key == glfw.KEY_D:
                         self.quad_scale = min(5.0, self.quad_scale * 1.1)
                         log.info(f"  Угловой размер: {self.quad_scale:.2f}")
-                    elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT or key == glfw.KEY_S:
+                    elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT or key == glfw.KEY_A:
                         self.quad_scale = max(0.1, self.quad_scale / 1.1)
                         log.info(f"  Угловой размер: {self.quad_scale:.2f}")
-                    elif key == glfw.KEY_E:
+                    elif key == glfw.KEY_S:
                         # Логарифмическое увеличение расстояния (дальше)
                         self.quad_distance = min(50.0, self.quad_distance * 1.15)
                         self.update_distance_texture()
                         log.info(f"  Расстояние: {self.quad_distance:.1f} м")
-                    elif key == glfw.KEY_Q:
+                    elif key == glfw.KEY_W:
                         # Логарифмическое уменьшение расстояния (ближе)
                         self.quad_distance = max(0.3, self.quad_distance / 1.15)
                         self.update_distance_texture()
                         log.info(f"  Расстояние: {self.quad_distance:.1f} м")
+                    elif key == glfw.KEY_R:
+                        # Сброс высоты головы (перецентровка)
+                        self.head_height = None
+                        log.info("  Высота головы сброшена")
+                    elif key == glfw.KEY_DELETE:
+                        # Удаление текущего изображения в корзину
+                        self.delete_current_image()
+                    elif key == glfw.KEY_F5:
+                        # Обновление списка файлов
+                        self.refresh_images()
             
             glfw.set_key_callback(self.window, key_callback)
             
@@ -1301,11 +1443,9 @@ class VRStereoViewer:
                         self.render_frame()
                         frame_count += 1
                         
-                        # Логируем статистику каждые 5 секунд
+                        # Счётчик кадров (можно использовать для отладки)
                         current_time = time.time()
                         if current_time - last_log_time >= 5.0:
-                            fps = frame_count / (current_time - last_log_time)
-                            log.info(f"  Рендеринг: {frame_count} кадров за 5 сек, ~{fps:.1f} FPS")
                             frame_count = 0
                             last_log_time = current_time
                             
