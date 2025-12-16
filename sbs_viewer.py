@@ -94,6 +94,17 @@ from xr import (
     SessionState,
     StructureType,
     Result,
+    ActionSet,
+    Action,
+    ActionType,
+    ActionCreateInfo,
+    ActionSetCreateInfo,
+    ActionStateGetInfo,
+    ActionsSyncInfo,
+    ActiveActionSet,
+    InteractionProfileSuggestedBinding,
+    ActionSuggestedBinding,
+    SessionActionSetsAttachInfo,
 )
 
 # OpenGL imports
@@ -299,6 +310,25 @@ class VRStereoViewer:
         self.views = []
         self.view_configs = []
         self.render_target_size = None
+        
+        # Контроллеры (Meta Quest 3 / Oculus Touch)
+        self.action_set: Optional[ActionSet] = None
+        self.thumbstick_y_action: Optional[Action] = None  # Thumbstick Y - расстояние
+        self.thumbstick_x_action: Optional[Action] = None  # Thumbstick X - масштаб
+        self.next_action: Optional[Action] = None  # A/X кнопки - следующее фото
+        self.prev_action: Optional[Action] = None  # B/Y кнопки - предыдущее фото
+        self.menu_action: Optional[Action] = None  # Menu кнопка - выход
+        self.trigger_action: Optional[Action] = None  # Триггеры
+        self.hand_paths = []  # Пути к левой и правой руке
+        
+        # Состояние контроллеров
+        self.last_thumbstick_y = [0.0, 0.0]  # [left, right]
+        self.thumbstick_deadzone = 0.2
+        self.thumbstick_speed_distance = 1.5  # Скорость изменения расстояния (экспоненциальная)
+        self.thumbstick_speed_scale = 0.5  # Скорость изменения масштаба
+        self.button_cooldown = 0.3  # Задержка между нажатиями (секунды)
+        self.last_next_press = 0.0
+        self.last_prev_press = 0.0
         
         # Параметры отображения (загружаем из конфига)
         settings = self.load_settings()
@@ -652,6 +682,377 @@ class VRStereoViewer:
         )
         self.view_space = xr.create_reference_space(self.session, view_space_info)
         log.debug("  ✓ VIEW space создан")
+        
+        # Инициализируем контроллеры
+        self.initialize_controller_actions()
+        
+    def initialize_controller_actions(self):
+        """Инициализация системы действий для контроллеров Meta Quest 3"""
+        log.info("=" * 50)
+        log.info("Инициализация контроллеров...")
+        
+        try:
+            # Создаём набор действий
+            action_set_info = xr.ActionSetCreateInfo(
+                action_set_name="viewer_controls",
+                localized_action_set_name="Viewer Controls",
+                priority=0,
+            )
+            self.action_set = xr.create_action_set(self.instance, action_set_info)
+            log.debug("  ✓ Action set создан")
+            
+            # Пути к рукам
+            self.hand_paths = (xr.Path * 2)(
+                xr.string_to_path(self.instance, "/user/hand/left"),
+                xr.string_to_path(self.instance, "/user/hand/right"),
+            )
+            
+            # Действие для thumbstick Y (вперёд-назад = расстояние)
+            self.thumbstick_y_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.FLOAT_INPUT,
+                    action_name="thumbstick_y",
+                    localized_action_name="Thumbstick Y (Distance)",
+                    count_subaction_paths=len(self.hand_paths),
+                    subaction_paths=self.hand_paths,
+                ),
+            )
+            log.debug("  ✓ Thumbstick Y action создан")
+            
+            # Действие для thumbstick X (влево-вправо = масштаб)
+            self.thumbstick_x_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.FLOAT_INPUT,
+                    action_name="thumbstick_x",
+                    localized_action_name="Thumbstick X (Scale)",
+                    count_subaction_paths=len(self.hand_paths),
+                    subaction_paths=self.hand_paths,
+                ),
+            )
+            log.debug("  ✓ Thumbstick X action создан")
+            
+            # Действие для кнопки "следующее фото" (A на правом, X на левом)
+            self.next_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.BOOLEAN_INPUT,
+                    action_name="next_image",
+                    localized_action_name="Next Image",
+                    count_subaction_paths=0,
+                    subaction_paths=None,
+                ),
+            )
+            log.debug("  ✓ Next action создан")
+            
+            # Действие для кнопки "предыдущее фото" (B на правом, Y на левом)
+            self.prev_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.BOOLEAN_INPUT,
+                    action_name="prev_image",
+                    localized_action_name="Previous Image",
+                    count_subaction_paths=0,
+                    subaction_paths=None,
+                ),
+            )
+            log.debug("  ✓ Prev action создан")
+            
+            # Действие для кнопки выхода (Menu)
+            self.menu_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.BOOLEAN_INPUT,
+                    action_name="menu_exit",
+                    localized_action_name="Menu/Exit",
+                    count_subaction_paths=0,
+                    subaction_paths=None,
+                ),
+            )
+            log.debug("  ✓ Menu action создан")
+            
+            # Действие для триггера (для удаления файлов - оба триггера одновременно)
+            self.trigger_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.FLOAT_INPUT,
+                    action_name="trigger",
+                    localized_action_name="Trigger",
+                    count_subaction_paths=len(self.hand_paths),
+                    subaction_paths=self.hand_paths,
+                ),
+            )
+            log.debug("  ✓ Trigger action создан")
+            
+            # === Привязки для Oculus Touch (Meta Quest 3) ===
+            # Пути к элементам управления
+            thumbstick_y_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/thumbstick/y"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/thumbstick/y"),
+            ]
+            thumbstick_x_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/thumbstick/x"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/thumbstick/x"),
+            ]
+            
+            # A/X кнопки (нижние кнопки)
+            a_click_path = xr.string_to_path(self.instance, "/user/hand/right/input/a/click")
+            x_click_path = xr.string_to_path(self.instance, "/user/hand/left/input/x/click")
+            
+            # B/Y кнопки (верхние кнопки)
+            b_click_path = xr.string_to_path(self.instance, "/user/hand/right/input/b/click")
+            y_click_path = xr.string_to_path(self.instance, "/user/hand/left/input/y/click")
+            
+            # Menu кнопка (только на левом контроллере у Oculus)
+            menu_click_path = xr.string_to_path(self.instance, "/user/hand/left/input/menu/click")
+            
+            # Триггеры
+            trigger_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/trigger/value"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/trigger/value"),
+            ]
+            
+            # Создаём привязки для Oculus Touch
+            oculus_bindings = [
+                # Thumbstick Y (вперёд-назад = расстояние) - оба контроллера
+                xr.ActionSuggestedBinding(self.thumbstick_y_action, thumbstick_y_path[0]),
+                xr.ActionSuggestedBinding(self.thumbstick_y_action, thumbstick_y_path[1]),
+                # Thumbstick X (влево-вправо = масштаб) - оба контроллера
+                xr.ActionSuggestedBinding(self.thumbstick_x_action, thumbstick_x_path[0]),
+                xr.ActionSuggestedBinding(self.thumbstick_x_action, thumbstick_x_path[1]),
+                # Next: A и X
+                xr.ActionSuggestedBinding(self.next_action, a_click_path),
+                xr.ActionSuggestedBinding(self.next_action, x_click_path),
+                # Prev: B и Y
+                xr.ActionSuggestedBinding(self.prev_action, b_click_path),
+                xr.ActionSuggestedBinding(self.prev_action, y_click_path),
+                # Menu
+                xr.ActionSuggestedBinding(self.menu_action, menu_click_path),
+                # Triggers
+                xr.ActionSuggestedBinding(self.trigger_action, trigger_path[0]),
+                xr.ActionSuggestedBinding(self.trigger_action, trigger_path[1]),
+            ]
+            
+            # Регистрируем для Oculus Touch контроллера
+            xr.suggest_interaction_profile_bindings(
+                instance=self.instance,
+                suggested_bindings=xr.InteractionProfileSuggestedBinding(
+                    interaction_profile=xr.string_to_path(
+                        self.instance,
+                        "/interaction_profiles/oculus/touch_controller",
+                    ),
+                    count_suggested_bindings=len(oculus_bindings),
+                    suggested_bindings=(xr.ActionSuggestedBinding * len(oculus_bindings))(*oculus_bindings),
+                ),
+            )
+            log.info("  ✓ Привязки Oculus Touch зарегистрированы")
+            
+            # === Привязки для KHR Simple Controller (fallback) ===
+            select_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/select/click"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/select/click"),
+            ]
+            simple_menu_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/menu/click"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/menu/click"),
+            ]
+            
+            simple_bindings = [
+                # Next: select на обоих
+                xr.ActionSuggestedBinding(self.next_action, select_path[0]),
+                xr.ActionSuggestedBinding(self.next_action, select_path[1]),
+                # Menu
+                xr.ActionSuggestedBinding(self.menu_action, simple_menu_path[0]),
+                xr.ActionSuggestedBinding(self.menu_action, simple_menu_path[1]),
+            ]
+            
+            xr.suggest_interaction_profile_bindings(
+                instance=self.instance,
+                suggested_bindings=xr.InteractionProfileSuggestedBinding(
+                    interaction_profile=xr.string_to_path(
+                        self.instance,
+                        "/interaction_profiles/khr/simple_controller",
+                    ),
+                    count_suggested_bindings=len(simple_bindings),
+                    suggested_bindings=(xr.ActionSuggestedBinding * len(simple_bindings))(*simple_bindings),
+                ),
+            )
+            log.debug("  ✓ Привязки Simple Controller зарегистрированы")
+            
+            # Присоединяем action set к сессии
+            xr.attach_session_action_sets(
+                session=self.session,
+                attach_info=xr.SessionActionSetsAttachInfo(
+                    count_action_sets=1,
+                    action_sets=ctypes.pointer(self.action_set),
+                ),
+            )
+            log.info("  ✓ Action set присоединён к сессии")
+            log.info("=" * 50)
+            log.info("Управление контроллерами:")
+            log.info("  Стики ↑↓ (вперёд-назад) - расстояние")
+            log.info("  Стики ←→ (влево-вправо) - масштаб")
+            log.info("  A/X - следующее фото")
+            log.info("  B/Y - предыдущее фото")
+            log.info("  Menu (левый) - выход")
+            log.info("  Оба триггера - удалить фото")
+            log.info("=" * 50)
+            
+        except Exception as e:
+            log.warning(f"Не удалось инициализировать контроллеры: {e}")
+            log.warning("Управление будет только с клавиатуры")
+            self.action_set = None
+        
+    def poll_controller_actions(self):
+        """Опрос состояния контроллеров и обработка ввода"""
+        if self.action_set is None:
+            return
+        
+        try:
+            # Синхронизируем действия
+            active_action_set = xr.ActiveActionSet(
+                action_set=self.action_set,
+                subaction_path=xr.NULL_PATH,
+            )
+            xr.sync_actions(
+                session=self.session,
+                sync_info=xr.ActionsSyncInfo(
+                    count_active_action_sets=1,
+                    active_action_sets=ctypes.pointer(active_action_set),
+                ),
+            )
+            
+            current_time = time.time()
+            
+            # === Обработка thumbstick с толерантностью к отклонениям ===
+            # Считываем оба значения (X и Y) для каждого контроллера
+            # и активируем только доминирующую ось
+            distance_changed = False
+            scale_changed = False
+            
+            for hand_idx in [0, 1]:  # left, right
+                # Получаем значения обеих осей
+                stick_y = xr.get_action_state_float(
+                    self.session,
+                    xr.ActionStateGetInfo(
+                        action=self.thumbstick_y_action,
+                        subaction_path=self.hand_paths[hand_idx],
+                    ),
+                )
+                stick_x = xr.get_action_state_float(
+                    self.session,
+                    xr.ActionStateGetInfo(
+                        action=self.thumbstick_x_action,
+                        subaction_path=self.hand_paths[hand_idx],
+                    ),
+                )
+                
+                y_val = stick_y.current_state if stick_y.is_active else 0.0
+                x_val = stick_x.current_state if stick_x.is_active else 0.0
+                
+                abs_y = abs(y_val)
+                abs_x = abs(x_val)
+                
+                # Определяем доминирующую ось (должна быть значительно больше другой)
+                # Коэффициент 1.5 означает, что доминирующая ось должна быть в 1.5 раза больше
+                dominance_ratio = 1.5
+                
+                # Y ось (расстояние) - активируем только если Y доминирует
+                # Экспоненциальное изменение: чем дальше, тем быстрее меняется
+                if abs_y > self.thumbstick_deadzone and abs_y > abs_x * dominance_ratio:
+                    factor = 1.0 + (y_val * self.thumbstick_speed_distance * 0.016)  # ~60fps
+                    self.quad_distance = max(0.3, min(50.0, self.quad_distance * factor))
+                    distance_changed = True
+                
+                # X ось (масштаб) - активируем только если X доминирует
+                if abs_x > self.thumbstick_deadzone and abs_x > abs_y * dominance_ratio:
+                    scale_delta = 1.0 + (x_val * self.thumbstick_speed_scale * 0.016)
+                    self.quad_scale = max(0.1, min(5.0, self.quad_scale * scale_delta))
+                    scale_changed = True
+            
+            if distance_changed:
+                self.update_distance_texture()
+                self.save_settings()
+            
+            if scale_changed:
+                self.save_settings()
+            
+            # === Обработка кнопок навигации ===
+            # Следующее фото (A/X)
+            next_state = xr.get_action_state_boolean(
+                session=self.session,
+                get_info=xr.ActionStateGetInfo(
+                    action=self.next_action,
+                    subaction_path=xr.NULL_PATH,
+                ),
+            )
+            if (next_state.is_active and 
+                next_state.current_state and 
+                next_state.changed_since_last_sync and
+                current_time - self.last_next_press > self.button_cooldown):
+                self.next_image()
+                self.last_next_press = current_time
+                log.debug("Controller: Next image")
+            
+            # Предыдущее фото (B/Y)
+            prev_state = xr.get_action_state_boolean(
+                session=self.session,
+                get_info=xr.ActionStateGetInfo(
+                    action=self.prev_action,
+                    subaction_path=xr.NULL_PATH,
+                ),
+            )
+            if (prev_state.is_active and 
+                prev_state.current_state and 
+                prev_state.changed_since_last_sync and
+                current_time - self.last_prev_press > self.button_cooldown):
+                self.prev_image()
+                self.last_prev_press = current_time
+                log.debug("Controller: Prev image")
+            
+            # === Кнопка выхода (Menu) ===
+            menu_state = xr.get_action_state_boolean(
+                session=self.session,
+                get_info=xr.ActionStateGetInfo(
+                    action=self.menu_action,
+                    subaction_path=xr.NULL_PATH,
+                ),
+            )
+            if menu_state.is_active and menu_state.current_state and menu_state.changed_since_last_sync:
+                log.info("Controller: Menu pressed - выход")
+                self.should_quit = True
+            
+            # === Удаление файла (оба триггера одновременно) ===
+            left_trigger = xr.get_action_state_float(
+                self.session,
+                xr.ActionStateGetInfo(
+                    action=self.trigger_action,
+                    subaction_path=self.hand_paths[0],
+                ),
+            )
+            right_trigger = xr.get_action_state_float(
+                self.session,
+                xr.ActionStateGetInfo(
+                    action=self.trigger_action,
+                    subaction_path=self.hand_paths[1],
+                ),
+            )
+            # Если оба триггера нажаты более чем на 90%
+            if (left_trigger.is_active and right_trigger.is_active and
+                left_trigger.current_state > 0.9 and right_trigger.current_state > 0.9):
+                if not hasattr(self, '_triggers_held'):
+                    self._triggers_held = False
+                if not self._triggers_held:
+                    self._triggers_held = True
+                    log.info("Controller: Both triggers - удаление файла")
+                    self.delete_current_image()
+            else:
+                self._triggers_held = False
+                
+        except Exception as e:
+            # Подавляем ошибки контроллеров чтобы не прерывать работу
+            pass
         
     def create_swapchains(self):
         """Создание swapchain для каждого вида"""
@@ -1448,12 +1849,18 @@ class VRStereoViewer:
             log.info("ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА")
             log.info("=" * 50)
             log.info("")
-            log.info("Управление:")
+            log.info("Управление клавиатурой:")
             log.info("  Перетащите файлы на окно для загрузки")
             log.info("  O - открыть файлы | F - открыть папку")
-            log.info("  ←/→ или A/D - переключение изображений")
-            log.info("  +/- - масштаб | W/S - расстояние")
-            log.info("  ESC/Q - выход")
+            log.info("  ←/→ или E/Q - переключение изображений")
+            log.info("  +/- или D/A - масштаб | W/S - расстояние")
+            log.info("  Delete - удалить фото | ESC - выход")
+            log.info("")
+            log.info("Управление контроллерами Meta Quest 3:")
+            log.info("  Стики ↑↓ - расстояние")
+            log.info("  Стики ←→ - масштаб")
+            log.info("  A/X - следующее | B/Y - предыдущее")
+            log.info("  Menu - выход | Оба триггера - удалить")
             log.info("")
             log.info("Ожидание готовности VR сессии...")
             
@@ -1571,6 +1978,10 @@ class VRStereoViewer:
                 # Проверяем появление новых файлов
                 self.check_for_new_files()
                 
+                # Опрос контроллеров (если сессия в фокусе)
+                if self.session_running:
+                    self.poll_controller_actions()
+                
                 if self.session_running:
                     try:
                         self.render_frame()
@@ -1631,6 +2042,14 @@ class VRStereoViewer:
                 for fb in fb_list:
                     glDeleteFramebuffers(1, [fb])
             log.debug("  ✓ Framebuffers удалены")
+            
+            # Удаляем action set контроллеров
+            if self.action_set:
+                try:
+                    xr.destroy_action_set(self.action_set)
+                    log.debug("  ✓ Action set удалён")
+                except:
+                    pass
             
             # Удаляем OpenXR объекты
             for swapchain in self.swapchains:
