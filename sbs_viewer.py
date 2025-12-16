@@ -319,7 +319,10 @@ class VRStereoViewer:
         self.prev_action: Optional[Action] = None  # B/Y кнопки - предыдущее фото
         self.menu_action: Optional[Action] = None  # Menu кнопка - выход
         self.trigger_action: Optional[Action] = None  # Триггеры
+        self.grip_action: Optional[Action] = None  # Grip/Squeeze (бампер под средним пальцем)
+        self.pose_action: Optional[Action] = None  # Поза контроллера
         self.hand_paths = []  # Пути к левой и правой руке
+        self.hand_spaces = [None, None]  # Пространства для отслеживания позиции рук
         
         # Состояние контроллеров
         self.last_thumbstick_y = [0.0, 0.0]  # [left, right]
@@ -329,6 +332,13 @@ class VRStereoViewer:
         self.button_cooldown = 0.3  # Задержка между нажатиями (секунды)
         self.last_next_press = 0.0
         self.last_prev_press = 0.0
+        
+        # Состояние для смещения изображения
+        self.image_offset_x = 0.0  # Смещение по горизонтали (метры)
+        self.image_offset_y = 0.0  # Смещение по вертикали (метры)
+        self.controller_grab_rot = [None, None]  # Ориентация контроллера при захвате [left, right]
+        self.translation_sensitivity = 0.05  # Чувствительность перемещения (метры/градус)
+        self.predicted_display_time = 0  # Время для locate_space
         
         # Параметры отображения (загружаем из конфига)
         settings = self.load_settings()
@@ -772,7 +782,7 @@ class VRStereoViewer:
             )
             log.debug("  ✓ Menu action создан")
             
-            # Действие для триггера (для удаления файлов - оба триггера одновременно)
+            # Действие для триггера (для сброса смещения вместе с grip)
             self.trigger_action = xr.create_action(
                 action_set=self.action_set,
                 create_info=xr.ActionCreateInfo(
@@ -784,6 +794,32 @@ class VRStereoViewer:
                 ),
             )
             log.debug("  ✓ Trigger action создан")
+            
+            # Действие для grip/squeeze (бампер - для перемещения изображения)
+            self.grip_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.FLOAT_INPUT,
+                    action_name="grip",
+                    localized_action_name="Grip",
+                    count_subaction_paths=len(self.hand_paths),
+                    subaction_paths=self.hand_paths,
+                ),
+            )
+            log.debug("  ✓ Grip action создан")
+            
+            # Действие для позы контроллера (отслеживание положения)
+            self.pose_action = xr.create_action(
+                action_set=self.action_set,
+                create_info=xr.ActionCreateInfo(
+                    action_type=xr.ActionType.POSE_INPUT,
+                    action_name="hand_pose",
+                    localized_action_name="Hand Pose",
+                    count_subaction_paths=len(self.hand_paths),
+                    subaction_paths=self.hand_paths,
+                ),
+            )
+            log.debug("  ✓ Pose action создан")
             
             # === Привязки для Oculus Touch (Meta Quest 3) ===
             # Пути к элементам управления
@@ -813,6 +849,18 @@ class VRStereoViewer:
                 xr.string_to_path(self.instance, "/user/hand/right/input/trigger/value"),
             ]
             
+            # Grip/Squeeze (бампер)
+            grip_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/squeeze/value"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/squeeze/value"),
+            ]
+            
+            # Поза контроллера
+            pose_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/grip/pose"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/grip/pose"),
+            ]
+            
             # Создаём привязки для Oculus Touch
             oculus_bindings = [
                 # Thumbstick Y (вперёд-назад = расстояние) - оба контроллера
@@ -832,6 +880,12 @@ class VRStereoViewer:
                 # Triggers
                 xr.ActionSuggestedBinding(self.trigger_action, trigger_path[0]),
                 xr.ActionSuggestedBinding(self.trigger_action, trigger_path[1]),
+                # Grip
+                xr.ActionSuggestedBinding(self.grip_action, grip_path[0]),
+                xr.ActionSuggestedBinding(self.grip_action, grip_path[1]),
+                # Pose
+                xr.ActionSuggestedBinding(self.pose_action, pose_path[0]),
+                xr.ActionSuggestedBinding(self.pose_action, pose_path[1]),
             ]
             
             # Регистрируем для Oculus Touch контроллера
@@ -857,6 +911,10 @@ class VRStereoViewer:
                 xr.string_to_path(self.instance, "/user/hand/left/input/menu/click"),
                 xr.string_to_path(self.instance, "/user/hand/right/input/menu/click"),
             ]
+            simple_pose_path = [
+                xr.string_to_path(self.instance, "/user/hand/left/input/grip/pose"),
+                xr.string_to_path(self.instance, "/user/hand/right/input/grip/pose"),
+            ]
             
             simple_bindings = [
                 # Next: select на обоих
@@ -865,6 +923,9 @@ class VRStereoViewer:
                 # Menu
                 xr.ActionSuggestedBinding(self.menu_action, simple_menu_path[0]),
                 xr.ActionSuggestedBinding(self.menu_action, simple_menu_path[1]),
+                # Pose
+                xr.ActionSuggestedBinding(self.pose_action, simple_pose_path[0]),
+                xr.ActionSuggestedBinding(self.pose_action, simple_pose_path[1]),
             ]
             
             xr.suggest_interaction_profile_bindings(
@@ -889,14 +950,24 @@ class VRStereoViewer:
                 ),
             )
             log.info("  ✓ Action set присоединён к сессии")
+            
+            # Создаём пространства для отслеживания позиции рук
+            for hand_idx in [0, 1]:
+                self.hand_spaces[hand_idx] = xr.create_action_space(
+                    session=self.session,
+                    create_info=xr.ActionSpaceCreateInfo(
+                        action=self.pose_action,
+                        subaction_path=self.hand_paths[hand_idx],
+                    ),
+                )
+            log.info("  ✓ Hand spaces созданы")
+            
             log.info("=" * 50)
             log.info("Управление контроллерами:")
-            log.info("  Стики ↑↓ (вперёд-назад) - расстояние")
-            log.info("  Стики ←→ (влево-вправо) - масштаб")
-            log.info("  A/X - следующее фото")
-            log.info("  B/Y - предыдущее фото")
-            log.info("  Menu (левый) - выход")
-            log.info("  Оба триггера - удалить фото")
+            log.info("  Стики ↑↓ - расстояние | ←→ - масштаб")
+            log.info("  A/X - следующее | B/Y - предыдущее")
+            log.info("  Grip + вращение запястья - смещение изображения")
+            log.info("  Trigger + Grip - сброс смещения | Menu - выход")
             log.info("=" * 50)
             
         except Exception as e:
@@ -1023,36 +1094,126 @@ class VRStereoViewer:
                 log.info("Controller: Menu pressed - выход")
                 self.should_quit = True
             
-            # === Удаление файла (оба триггера одновременно) ===
-            left_trigger = xr.get_action_state_float(
-                self.session,
-                xr.ActionStateGetInfo(
-                    action=self.trigger_action,
-                    subaction_path=self.hand_paths[0],
-                ),
-            )
-            right_trigger = xr.get_action_state_float(
-                self.session,
-                xr.ActionStateGetInfo(
-                    action=self.trigger_action,
-                    subaction_path=self.hand_paths[1],
-                ),
-            )
-            # Если оба триггера нажаты более чем на 90%
-            if (left_trigger.is_active and right_trigger.is_active and
-                left_trigger.current_state > 0.9 and right_trigger.current_state > 0.9):
-                if not hasattr(self, '_triggers_held'):
-                    self._triggers_held = False
-                if not self._triggers_held:
-                    self._triggers_held = True
-                    log.info("Controller: Both triggers - удаление файла")
-                    self.delete_current_image()
-            else:
-                self._triggers_held = False
+            # === Получаем состояние триггеров и grip ===
+            trigger_values = [0.0, 0.0]
+            grip_values = [0.0, 0.0]
+            
+            for hand_idx in [0, 1]:
+                trigger_state = xr.get_action_state_float(
+                    self.session,
+                    xr.ActionStateGetInfo(
+                        action=self.trigger_action,
+                        subaction_path=self.hand_paths[hand_idx],
+                    ),
+                )
+                if trigger_state.is_active:
+                    trigger_values[hand_idx] = trigger_state.current_state
+                
+                grip_state = xr.get_action_state_float(
+                    self.session,
+                    xr.ActionStateGetInfo(
+                        action=self.grip_action,
+                        subaction_path=self.hand_paths[hand_idx],
+                    ),
+                )
+                if grip_state.is_active:
+                    grip_values[hand_idx] = grip_state.current_state
+            
+            # Логируем значения если что-то зажато (для отладки)
+            # if trigger_values[0] > 0.5 or trigger_values[1] > 0.5:
+            #     log.debug(f"Триггеры: L={trigger_values[0]:.2f} R={trigger_values[1]:.2f}")
+            # if grip_values[0] > 0.5 or grip_values[1] > 0.5:
+            #     log.debug(f"Grip: L={grip_values[0]:.2f} R={grip_values[1]:.2f}")
+            
+            # === Перемещение изображения (grip + вращение контроллера) ===
+            for hand_idx in [0, 1]:
+                grip_held = grip_values[hand_idx] > 0.5
+                trigger_held = trigger_values[hand_idx] > 0.5
+                
+                # Сброс смещения (триггер + grip одновременно на любой руке)
+                if grip_held and trigger_held:
+                    if not hasattr(self, '_reset_held'):
+                        self._reset_held = False
+                    if not self._reset_held:
+                        self._reset_held = True
+                        self.image_offset_x = 0.0
+                        self.image_offset_y = 0.0
+                        log.info("Controller: Сброс смещения изображения")
+                    self.controller_grab_rot[hand_idx] = None
+                    continue
+                
+                if not grip_held:
+                    # Grip не зажат - сбрасываем начальную ориентацию
+                    self.controller_grab_rot[hand_idx] = None
+                    continue
+                
+                # Получаем ориентацию контроллера
+                if self.hand_spaces[hand_idx] is None:
+                    continue
+                    
+                try:
+                    pose_state = xr.get_action_state_pose(
+                        session=self.session,
+                        get_info=xr.ActionStateGetInfo(
+                            action=self.pose_action,
+                            subaction_path=self.hand_paths[hand_idx],
+                        ),
+                    )
+                    
+                    if not pose_state.is_active:
+                        continue
+                    
+                    space_location = xr.locate_space(
+                        space=self.hand_spaces[hand_idx],
+                        base_space=self.local_space,
+                        time=self.predicted_display_time,
+                    )
+                    
+                    if not (space_location.location_flags & xr.SPACE_LOCATION_ORIENTATION_VALID_BIT):
+                        continue
+                    
+                    # Получаем ориентацию контроллера (кватернион)
+                    q = space_location.pose.orientation
+                    
+                    # Конвертируем кватернион в углы Эйлера (yaw, pitch)
+                    sinr_cosp = 2 * (q.w * q.x + q.y * q.z)
+                    cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y)
+                    pitch = np.arctan2(sinr_cosp, cosr_cosp)  # Вращение вокруг X
+                    
+                    siny_cosp = 2 * (q.w * q.y - q.z * q.x)
+                    yaw = np.arcsin(np.clip(siny_cosp, -1, 1))  # Вращение вокруг Y
+                    
+                    current_rot = (np.degrees(yaw), np.degrees(pitch))
+                    
+                    # Grip зажат - перемещение изображения
+                    if self.controller_grab_rot[hand_idx] is not None:
+                        # Вычисляем дельту вращения контроллера
+                        delta_yaw = current_rot[0] - self.controller_grab_rot[hand_idx][0]
+                        delta_pitch = current_rot[1] - self.controller_grab_rot[hand_idx][1]
+                        
+                        # Обрабатываем переход через 180/-180
+                        if delta_yaw > 90:
+                            delta_yaw -= 180
+                        elif delta_yaw < -90:
+                            delta_yaw += 180
+                        
+                        # Перемещаем изображение
+                        self.image_offset_x -= delta_yaw * self.translation_sensitivity
+                        self.image_offset_y += delta_pitch * self.translation_sensitivity
+                    
+                    # Обновляем референсную точку
+                    self.controller_grab_rot[hand_idx] = current_rot
+                        
+                except Exception as e:
+                    log.debug(f"Controller error [{hand_idx}]: {e}")
+            
+            # Сброс флага reset когда отпустили
+            if not any(grip_values[i] > 0.5 and trigger_values[i] > 0.5 for i in [0, 1]):
+                self._reset_held = False
                 
         except Exception as e:
-            # Подавляем ошибки контроллеров чтобы не прерывать работу
-            pass
+            # Логируем ошибки контроллеров
+            log.debug(f"Controller error: {e}")
         
     def create_swapchains(self):
         """Создание swapchain для каждого вида"""
@@ -1350,14 +1511,17 @@ class VRStereoViewer:
         aspect_ratio = img_width / img_height
         
         # 4. Матрица модели - прямоугольник перед пользователем
-        # Позиция: перед пользователем на расстоянии quad_distance
-        # Y = фиксированная высота головы (одинаковая для обоих глаз!)
-        # При первом кадре запоминаем высоту
+        # Позиция фиксированная, вращение "себя" уже применено к view matrix
         if self.head_height is None:
             self.head_height = pose.position.y
         eye_height = self.head_height
-        quad_pos = xr.Vector3f(0, eye_height, -self.quad_distance)
-        quad_rot = xr.Quaternionf(0, 0, 0, 1)  # Без вращения
+        
+        # Позиция с учётом смещения (без вращения - оно в view matrix)
+        quad_pos = xr.Vector3f(self.image_offset_x, eye_height + self.image_offset_y, -self.quad_distance)
+        
+        # Ориентация: изображение смотрит на пользователя (без вращения)
+        quad_rot = xr.Quaternionf(0, 0, 0, 1)
+        
         # Физический размер = base_size * quad_scale * расстояние (для сохранения углового размера)
         physical_scale = self.base_size * self.quad_scale * self.quad_distance
         quad_scale = xr.Vector3f(physical_scale * aspect_ratio, physical_scale, 1)
@@ -1397,16 +1561,20 @@ class VRStereoViewer:
         # Коэффициент масштабирования надписей (сохраняем угловой размер)
         label_scale_factor = self.quad_distance
         
-        # Позиция под изображением
-        label_y = eye_height - (physical_scale * 0.5) - 0.02 * label_scale_factor
+        # Позиция под изображением (с учётом смещения)
+        label_base_y = eye_height + self.image_offset_y - (physical_scale * 0.5) - 0.02 * label_scale_factor
+        label_x = self.image_offset_x
+        label_z = -self.quad_distance + 0.01
+        
+        current_label_offset = 0.0
         
         # 1. Название файла
         if current_image.name_texture:
             text_height = 0.03 * label_scale_factor  # Угловой размер ~1.7°
             text_width = text_height * current_image.name_aspect
             
-            label_y -= text_height
-            text_pos = xr.Vector3f(0, label_y, -self.quad_distance + 0.01)
+            current_label_offset -= text_height
+            text_pos = xr.Vector3f(label_x, label_base_y + current_label_offset, label_z)
             text_scale = xr.Vector3f(text_width, text_height, 1)
             text_model = Matrix4x4f.create_translation_rotation_scale(text_pos, quad_rot, text_scale)
             
@@ -1416,15 +1584,15 @@ class VRStereoViewer:
             glBindTexture(GL_TEXTURE_2D, current_image.name_texture)
             glDrawArrays(GL_TRIANGLES, 0, 6)
             
-            label_y -= 0.005 * label_scale_factor  # Отступ между названием и расстоянием
+            current_label_offset -= 0.005 * label_scale_factor  # Отступ между названием и расстоянием
         
         # 2. Расстояние
         if self.distance_texture:
             dist_height = 0.02 * label_scale_factor  # Угловой размер ~1.1°
             dist_width = dist_height * self.distance_aspect
             
-            label_y -= dist_height
-            dist_pos = xr.Vector3f(0, label_y, -self.quad_distance + 0.01)
+            current_label_offset -= dist_height
+            dist_pos = xr.Vector3f(label_x, label_base_y + current_label_offset, label_z)
             dist_scale = xr.Vector3f(dist_width, dist_height, 1)
             dist_model = Matrix4x4f.create_translation_rotation_scale(dist_pos, quad_rot, dist_scale)
             
@@ -1444,6 +1612,9 @@ class VRStereoViewer:
         """Рендеринг одного кадра"""
         # Ожидаем кадр (это блокирующий вызов!)
         frame_state = xr.wait_frame(self.session)
+        
+        # Сохраняем время для использования в poll_controller_actions
+        self.predicted_display_time = frame_state.predicted_display_time
         
         # Начинаем кадр
         xr.begin_frame(self.session)
@@ -1857,10 +2028,10 @@ class VRStereoViewer:
             log.info("  Delete - удалить фото | ESC - выход")
             log.info("")
             log.info("Управление контроллерами Meta Quest 3:")
-            log.info("  Стики ↑↓ - расстояние")
-            log.info("  Стики ←→ - масштаб")
-            log.info("  A/X - следующее | B/Y - предыдущее")
-            log.info("  Menu - выход | Оба триггера - удалить")
+            log.info("  Стики ↑↓ - расстояние | ←→ - масштаб")
+            log.info("  Grip + вращение запястья - смещение изображения")
+            log.info("  A/X - след. | B/Y - пред. | Menu - выход")
+            log.info("  Trigger + Grip - сброс смещения")
             log.info("")
             log.info("Ожидание готовности VR сессии...")
             
@@ -1893,6 +2064,11 @@ class VRStereoViewer:
                         self.save_settings()
                     elif key == glfw.KEY_R:
                         self.head_height = None
+                    elif key == glfw.KEY_C or key == glfw.KEY_HOME:
+                        # Сброс смещения изображения
+                        self.image_offset_x = 0.0
+                        self.image_offset_y = 0.0
+                        log.info("Сброс смещения изображения")
                     elif key == glfw.KEY_DELETE:
                         # Удаление текущего изображения в корзину
                         self.delete_current_image()
@@ -1978,13 +2154,11 @@ class VRStereoViewer:
                 # Проверяем появление новых файлов
                 self.check_for_new_files()
                 
-                # Опрос контроллеров (если сессия в фокусе)
-                if self.session_running:
-                    self.poll_controller_actions()
-                
                 if self.session_running:
                     try:
                         self.render_frame()
+                        # Опрос контроллеров после render_frame (нужен predicted_display_time)
+                        self.poll_controller_actions()
                         frame_count += 1
                         
                         # Счётчик кадров (можно использовать для отладки)
@@ -2042,6 +2216,15 @@ class VRStereoViewer:
                 for fb in fb_list:
                     glDeleteFramebuffers(1, [fb])
             log.debug("  ✓ Framebuffers удалены")
+            
+            # Удаляем hand spaces
+            for space in self.hand_spaces:
+                if space is not None:
+                    try:
+                        xr.destroy_space(space)
+                    except:
+                        pass
+            log.debug("  ✓ Hand spaces удалены")
             
             # Удаляем action set контроллеров
             if self.action_set:
