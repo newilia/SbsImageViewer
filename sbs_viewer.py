@@ -14,6 +14,7 @@ import argparse
 import logging
 import time
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -123,7 +124,16 @@ class StereoImage:
     @classmethod
     def from_sbs(cls, image_path: str) -> 'StereoImage':
         """Загрузка SBS (side-by-side) изображения"""
-        img = Image.open(image_path).convert('RGBA')
+        img = Image.open(image_path)
+        
+        # Конвертируем только если нужно (RGB быстрее чем RGBA)
+        if img.mode == 'RGBA':
+            pass  # Уже RGBA
+        elif img.mode == 'RGB':
+            img = img.convert('RGBA')  # Добавляем альфа-канал
+        else:
+            img = img.convert('RGBA')
+        
         width, height = img.size
         
         # Разделяем изображение пополам
@@ -189,6 +199,7 @@ class StereoImage:
         texture = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, texture)
         
+        # Качественная фильтрация с mipmaps для сглаживания
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
@@ -297,17 +308,19 @@ class VRStereoViewer:
         self.distance_texture: Optional[int] = None
         self.distance_aspect: float = 1.0
         self.head_height: Optional[float] = None  # Высота головы (центр между глазами)
+        self.watch_folder: Optional[str] = None  # Папка для мониторинга
+        self.last_folder_check: float = 0  # Время последней проверки папки
+        self.folder_check_interval: float = 2.0  # Интервал проверки (секунды)
         
         log.info(f"Загружены настройки: расстояние={self.quad_distance:.1f}м, масштаб={self.quad_scale:.2f}")
         
     def load_images(self):
-        """Загрузка всех изображений"""
+        """Подготовка списка изображений (ленивая загрузка)"""
         # Если передан один файл - загружаем все изображения из его папки
         if len(self.image_paths) == 1 and os.path.isfile(self.image_paths[0]):
             single_file = self.image_paths[0]
             folder = os.path.dirname(single_file)
             if folder:
-                log.info(f"Загрузка всех изображений из папки: {folder}")
                 all_files = find_images(folder)
                 if all_files:
                     self.image_paths = all_files
@@ -318,37 +331,128 @@ class VRStereoViewer:
                     except ValueError:
                         self.current_index = 0
         
-        log.info(f"Загрузка {len(self.image_paths)} изображений...")
-        
+        # Фильтруем пути (убираем _right файлы для режима separate)
+        filtered_paths = []
         for path in self.image_paths:
-            try:
-                log.debug(f"  Обработка: {path}")
-                if self.sbs_mode:
-                    img = StereoImage.from_sbs(path)
-                else:
-                    # Для режима отдельных файлов ожидаем пары _left/_right
-                    if '_left' in path.lower():
-                        right_path = path.lower().replace('_left', '_right')
-                        for orig_path in self.image_paths:
-                            if orig_path.lower() == right_path:
-                                img = StereoImage.from_separate_files(path, orig_path)
-                                break
-                        else:
-                            continue
-                    elif '_right' in path.lower():
-                        continue  # Пропускаем, уже обработано с _left
-                    else:
-                        # Загружаем как SBS по умолчанию
-                        img = StereoImage.from_sbs(path)
-                
-                self.images.append(img)
-                log.info(f"  ✓ Загружено: {img.name} ({img.left.shape[1]}x{img.left.shape[0]})")
-            except Exception as e:
-                log.error(f"  ✗ Ошибка загрузки {path}: {e}")
+            if not self.sbs_mode and '_right' in path.lower():
+                continue
+            filtered_paths.append(path)
+        self.image_paths = filtered_paths
         
-        log.info(f"Всего загружено {len(self.images)} стереопар")
+        log.info(f"Найдено {len(self.image_paths)} изображений")
+        
+        # Создаём placeholder-объекты (загрузка будет при показе)
+        for path in self.image_paths:
+            # Создаём пустой объект с путём
+            img = StereoImage(np.array([]), np.array([]), Path(path).name, os.path.abspath(path))
+            img._loaded = False  # Флаг загрузки
+            self.images.append(img)
+        
+        # Загружаем только первое изображение сразу
         if self.images:
-            log.info(f"Текущее изображение: {self.images[self.current_index].name}")
+            self._load_image_data(self.current_index)
+            log.info(f"Загружено: {self.images[self.current_index].name}")
+            # Предзагружаем соседние в фоне
+            self._preload_nearby()
+        
+        # Запоминаем папку для мониторинга
+        if self.image_paths:
+            first_path = self.image_paths[0]
+            if os.path.isfile(first_path):
+                self.watch_folder = os.path.dirname(first_path)
+            else:
+                self.watch_folder = first_path
+    
+    def _load_image_data(self, index: int):
+        """Загрузка данных изображения по индексу"""
+        if index < 0 or index >= len(self.images):
+            return
+        
+        img = self.images[index]
+        if hasattr(img, '_loaded') and img._loaded:
+            return  # Уже загружено
+        
+        path = img.path
+        try:
+            if self.sbs_mode:
+                loaded = StereoImage.from_sbs(path)
+            else:
+                if '_left' in path.lower():
+                    right_path = path.replace('_left', '_right').replace('_Left', '_Right')
+                    if os.path.exists(right_path):
+                        loaded = StereoImage.from_separate_files(path, right_path)
+                    else:
+                        loaded = StereoImage.from_sbs(path)
+                else:
+                    loaded = StereoImage.from_sbs(path)
+            
+            # Копируем данные
+            img.left = loaded.left
+            img.right = loaded.right
+            img._loaded = True
+        except Exception as e:
+            log.error(f"Ошибка загрузки {path}: {e}")
+            # Создаём пустое изображение чтобы не падать
+            img.left = np.zeros((100, 100, 4), dtype=np.uint8)
+            img.right = np.zeros((100, 100, 4), dtype=np.uint8)
+            img._loaded = True
+    
+    def _preload_nearby(self):
+        """Предзагрузка соседних изображений в фоне"""
+        if len(self.images) <= 1:
+            return
+        
+        # Индексы для предзагрузки: следующее и предыдущее
+        indices_to_preload = [
+            (self.current_index + 1) % len(self.images),
+            (self.current_index - 1) % len(self.images),
+        ]
+        
+        for idx in indices_to_preload:
+            if idx != self.current_index:
+                img = self.images[idx]
+                if not hasattr(img, '_loaded') or not img._loaded:
+                    # Загружаем в фоновом потоке
+                    thread = threading.Thread(
+                        target=self._load_image_data,
+                        args=(idx,),
+                        daemon=True
+                    )
+                    thread.start()
+    
+    def check_for_new_files(self):
+        """Проверка появления новых файлов в папке"""
+        current_time = time.time()
+        if current_time - self.last_folder_check < self.folder_check_interval:
+            return
+        
+        self.last_folder_check = current_time
+        
+        if not self.watch_folder or not os.path.isdir(self.watch_folder):
+            return
+        
+        # Получаем текущий список файлов
+        current_files = set(find_images(self.watch_folder))
+        known_files = set(os.path.normpath(img.path) for img in self.images if img.path)
+        
+        # Находим новые файлы
+        new_files = current_files - known_files
+        
+        if new_files:
+            log.info(f"🆕 Обнаружено {len(new_files)} новых файлов")
+            
+            # Добавляем новые файлы
+            for path in sorted(new_files):
+                norm_path = os.path.normpath(path)
+                if not self.sbs_mode and '_right' in norm_path.lower():
+                    continue
+                
+                img = StereoImage(np.array([]), np.array([]), Path(path).name, os.path.abspath(path))
+                img._loaded = False
+                self.images.append(img)
+                self.image_paths.append(path)
+            
+            log.info(f"Всего изображений: {len(self.images)}")
     
     def initialize_openxr_instance(self):
         """Инициализация OpenXR Instance и получение требований к графике"""
@@ -693,10 +797,23 @@ class VRStereoViewer:
         glBindVertexArray(0)
         
     def create_textures(self):
-        """Создание текстур для всех загруженных изображений"""
-        for img in self.images:
-            img.create_textures()
+        """Создание текстур (только для текущего изображения)"""
+        # Создаём текстуру только для текущего изображения (ленивая загрузка)
+        if self.images:
+            self.ensure_current_texture()
         self.update_distance_texture()
+    
+    def ensure_current_texture(self):
+        """Убедиться, что текстура текущего изображения создана"""
+        if not self.images:
+            return
+        
+        # Сначала загружаем данные изображения если нужно
+        self._load_image_data(self.current_index)
+        
+        current = self.images[self.current_index]
+        if current.left_texture is None:
+            current.create_textures()
     
     def update_distance_texture(self):
         """Обновление текстуры с расстоянием"""
@@ -1109,13 +1226,15 @@ class VRStereoViewer:
         """Переход к следующему изображению"""
         if self.images and len(self.images) > 1:
             self.current_index = (self.current_index + 1) % len(self.images)
-            log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
+            self.ensure_current_texture()
+            self._preload_nearby()
             
     def prev_image(self):
         """Переход к предыдущему изображению"""
         if self.images and len(self.images) > 1:
             self.current_index = (self.current_index - 1) % len(self.images)
-            log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
+            self.ensure_current_texture()
+            self._preload_nearby()
     
     def delete_current_image(self):
         """Удаление текущего изображения в корзину"""
@@ -1162,7 +1281,6 @@ class VRStereoViewer:
             if self.images:
                 if self.current_index >= len(self.images):
                     self.current_index = len(self.images) - 1
-                log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
             else:
                 log.info("Все изображения удалены")
                 
@@ -1202,32 +1320,18 @@ class VRStereoViewer:
             log.warning(f"Изображения не найдены в: {folder}")
             return
         
-        self.image_paths = new_paths
-        log.info(f"🔄 Обновлено: найдено {len(new_paths)} файлов в {folder}")
+        # Фильтруем _right файлы
+        if not self.sbs_mode:
+            new_paths = [p for p in new_paths if '_right' not in p.lower()]
         
-        # Загружаем изображения
+        self.image_paths = new_paths
+        log.info(f"🔄 Обновлено: {len(new_paths)} файлов")
+        
+        # Создаём placeholder-объекты (ленивая загрузка)
         for path in self.image_paths:
-            try:
-                if self.sbs_mode:
-                    img = StereoImage.from_sbs(path)
-                else:
-                    if '_left' in path.lower():
-                        right_path = path.lower().replace('_left', '_right')
-                        for orig_path in self.image_paths:
-                            if orig_path.lower() == right_path:
-                                img = StereoImage.from_separate_files(path, orig_path)
-                                break
-                        else:
-                            continue
-                    elif '_right' in path.lower():
-                        continue
-                    else:
-                        img = StereoImage.from_sbs(path)
-                
-                img.create_textures()
-                self.images.append(img)
-            except Exception as e:
-                log.debug(f"Ошибка загрузки {path}: {e}")
+            img = StereoImage(np.array([]), np.array([]), Path(path).name, os.path.abspath(path))
+            img._loaded = False
+            self.images.append(img)
         
         # Восстанавливаем позицию на том же изображении если возможно
         self.current_index = 0
@@ -1237,8 +1341,9 @@ class VRStereoViewer:
                     self.current_index = i
                     break
         
+        # Загружаем текущее изображение
         if self.images:
-            log.info(f"Изображение [{self.current_index + 1}/{len(self.images)}]: {self.images[self.current_index].name}")
+            self.ensure_current_texture()
     
     def add_images_from_paths(self, paths: List[str], replace: bool = False):
         """
@@ -1337,7 +1442,7 @@ class VRStereoViewer:
             self.create_quad()
             log.debug("  ✓ Геометрия создана")
             self.create_textures()
-            log.info(f"  ✓ Текстуры созданы ({len(self.images)} изображений)")
+            log.info(f"  ✓ Текстура создана")
             
             log.info("=" * 50)
             log.info("ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА")
@@ -1367,28 +1472,20 @@ class VRStereoViewer:
                         self.prev_image()
                     elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD or key == glfw.KEY_D:
                         self.quad_scale = min(5.0, self.quad_scale * 1.1)
-                        log.info(f"  Угловой размер: {self.quad_scale:.2f}")
                         self.save_settings()
                     elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT or key == glfw.KEY_A:
                         self.quad_scale = max(0.1, self.quad_scale / 1.1)
-                        log.info(f"  Угловой размер: {self.quad_scale:.2f}")
                         self.save_settings()
                     elif key == glfw.KEY_W:
-                        # Логарифмическое увеличение расстояния (дальше)
                         self.quad_distance = min(50.0, self.quad_distance * 1.15)
                         self.update_distance_texture()
-                        log.info(f"  Расстояние: {self.quad_distance:.1f} м")
                         self.save_settings()
                     elif key == glfw.KEY_S:
-                        # Логарифмическое уменьшение расстояния (ближе)
                         self.quad_distance = max(0.3, self.quad_distance / 1.15)
                         self.update_distance_texture()
-                        log.info(f"  Расстояние: {self.quad_distance:.1f} м")
                         self.save_settings()
                     elif key == glfw.KEY_R:
-                        # Сброс высоты головы (перецентровка)
                         self.head_height = None
-                        log.info("  Высота головы сброшена")
                     elif key == glfw.KEY_DELETE:
                         # Удаление текущего изображения в корзину
                         self.delete_current_image()
@@ -1470,6 +1567,9 @@ class VRStereoViewer:
             while not self.should_quit and not glfw.window_should_close(self.window):
                 glfw.poll_events()
                 self.poll_events()
+                
+                # Проверяем появление новых файлов
+                self.check_for_new_files()
                 
                 if self.session_running:
                     try:
