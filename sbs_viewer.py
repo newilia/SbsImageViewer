@@ -351,6 +351,7 @@ class VRStereoViewer:
         self.watch_folder: Optional[str] = None  # Папка для мониторинга
         self.last_folder_check: float = 0  # Время последней проверки папки
         self.folder_check_interval: float = 2.0  # Интервал проверки (секунды)
+        self.cross_eyed_mode: bool = False  # Режим просмотра: False = parallel, True = cross-eyed
         
         log.info(f"Загружены настройки: расстояние={self.quad_distance:.1f}м, масштаб={self.quad_scale:.2f}")
         
@@ -1540,7 +1541,11 @@ class VRStereoViewer:
         glUniform1i(use_tex_loc, 1)
         
         # Привязываем текстуру (левую для левого глаза, правую для правого)
-        texture = current_image.left_texture if view_index == 0 else current_image.right_texture
+        # В режиме cross-eyed текстуры меняются местами
+        if self.cross_eyed_mode:
+            texture = current_image.right_texture if view_index == 0 else current_image.left_texture
+        else:
+            texture = current_image.left_texture if view_index == 0 else current_image.right_texture
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, texture)
         tex_loc = glGetUniformLocation(self.shader_program, "uTexture")
@@ -2025,6 +2030,7 @@ class VRStereoViewer:
             log.info("  O - открыть файлы | F - открыть папку")
             log.info("  ←/→ или E/Q - переключение изображений")
             log.info("  +/- или D/A - масштаб | W/S - расстояние")
+            log.info("  C - cross-eyed/parallel | Home - сброс смещения")
             log.info("  Delete - удалить фото | ESC - выход")
             log.info("")
             log.info("Управление контроллерами Meta Quest 3:")
@@ -2064,7 +2070,12 @@ class VRStereoViewer:
                         self.save_settings()
                     elif key == glfw.KEY_R:
                         self.head_height = None
-                    elif key == glfw.KEY_C or key == glfw.KEY_HOME:
+                    elif key == glfw.KEY_C:
+                        # Переключение режима cross-eyed / parallel
+                        self.cross_eyed_mode = not self.cross_eyed_mode
+                        mode_name = "Cross-eyed" if self.cross_eyed_mode else "Parallel"
+                        log.info(f"Режим просмотра: {mode_name}")
+                    elif key == glfw.KEY_HOME:
                         # Сброс смещения изображения
                         self.image_offset_x = 0.0
                         self.image_offset_y = 0.0
