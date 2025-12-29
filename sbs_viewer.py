@@ -347,6 +347,8 @@ class VRStereoViewer:
         self.base_size = 1.0  # Базовый физический размер при расстоянии 1м
         self.distance_texture: Optional[int] = None
         self.distance_aspect: float = 1.0
+        self.counter_texture: Optional[int] = None
+        self.counter_aspect: float = 1.0
         self.head_height: Optional[float] = None  # Высота головы (центр между глазами)
         self.watch_folder: Optional[str] = None  # Папка для мониторинга
         self.last_folder_check: float = 0  # Время последней проверки папки
@@ -494,6 +496,7 @@ class VRStereoViewer:
                 self.image_paths.append(path)
             
             log.info(f"Всего изображений: {len(self.images)}")
+            self.update_counter_texture()
     
     def initialize_openxr_instance(self):
         """Инициализация OpenXR Instance и получение требований к графике"""
@@ -1365,6 +1368,7 @@ class VRStereoViewer:
         if self.images:
             self.ensure_current_texture()
         self.update_distance_texture()
+        self.update_counter_texture()
     
     def ensure_current_texture(self):
         """Убедиться, что текстура текущего изображения создана"""
@@ -1379,15 +1383,16 @@ class VRStereoViewer:
             current.create_textures()
     
     def update_distance_texture(self):
-        """Обновление текстуры с расстоянием"""
+        """Обновление текстуры с расстоянием и режимом просмотра"""
         from PIL import ImageDraw, ImageFont
         
         # Удаляем старую текстуру
         if self.distance_texture:
             glDeleteTextures(1, [self.distance_texture])
         
-        # Текст с расстоянием
-        text = f"{self.quad_distance:.1f} м"
+        # Текст с расстоянием и режимом
+        mode_name = "Cross" if self.cross_eyed_mode else "Parallel"
+        text = f"{self.quad_distance:.1f} м | {mode_name}"
         
         try:
             font = ImageFont.truetype("arial.ttf", 36)
@@ -1420,6 +1425,53 @@ class VRStereoViewer:
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, text_width, text_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
         
         self.distance_texture = texture
+    
+    def update_counter_texture(self):
+        """Обновление текстуры со счётчиком изображений"""
+        from PIL import ImageDraw, ImageFont
+        
+        # Удаляем старую текстуру
+        if self.counter_texture:
+            glDeleteTextures(1, [self.counter_texture])
+            self.counter_texture = None
+        
+        if not self.images:
+            return
+        
+        # Текст со счётчиком
+        text = f"({self.current_index + 1}/{len(self.images)})"
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", 48)
+        except:
+            font = ImageFont.load_default()
+        
+        # Измеряем размер текста
+        dummy_img = Image.new('RGBA', (1, 1))
+        draw = ImageDraw.Draw(dummy_img)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0] + 20
+        text_height = bbox[3] - bbox[1] + 10
+        
+        # Создаём изображение
+        img = Image.new('RGBA', (text_width, text_height), (0, 0, 0, 180))
+        draw = ImageDraw.Draw(img)
+        draw.text((10, 0), text, fill=(255, 255, 255, 255), font=font)
+        
+        self.counter_aspect = text_width / text_height
+        
+        # Создаём текстуру
+        texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        
+        img_data = np.array(img, dtype=np.uint8)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, text_width, text_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+        
+        self.counter_texture = texture
             
     def create_projection_matrix(self, fov: xr.Fovf, near: float = 0.1, far: float = 100.0) -> np.ndarray:
         """Создание матрицы проекции из FOV"""
@@ -1573,13 +1625,22 @@ class VRStereoViewer:
         
         current_label_offset = 0.0
         
-        # 1. Название файла
+        # 1. Название файла и счётчик
         if current_image.name_texture:
             text_height = 0.03 * label_scale_factor  # Угловой размер ~1.7°
             text_width = text_height * current_image.name_aspect
             
+            # Если есть счётчик, рисуем имя файла левее центра
+            counter_width = 0.0
+            if self.counter_texture:
+                counter_width = text_height * self.counter_aspect
+            
+            total_width = text_width + counter_width + 0.005 * label_scale_factor  # Отступ между именем и счётчиком
+            
             current_label_offset -= text_height
-            text_pos = xr.Vector3f(label_x, label_base_y + current_label_offset, label_z)
+            # Смещаем имя файла влево, чтобы центрировать всю строку
+            name_x = label_x - total_width / 2 + text_width / 2
+            text_pos = xr.Vector3f(name_x, label_base_y + current_label_offset, label_z)
             text_scale = xr.Vector3f(text_width, text_height, 1)
             text_model = Matrix4x4f.create_translation_rotation_scale(text_pos, quad_rot, text_scale)
             
@@ -1588,6 +1649,19 @@ class VRStereoViewer:
             
             glBindTexture(GL_TEXTURE_2D, current_image.name_texture)
             glDrawArrays(GL_TRIANGLES, 0, 6)
+            
+            # Рисуем счётчик справа от имени файла
+            if self.counter_texture:
+                counter_x = name_x + text_width / 2 + 0.005 * label_scale_factor + counter_width / 2
+                counter_pos = xr.Vector3f(counter_x, label_base_y + current_label_offset, label_z)
+                counter_scale = xr.Vector3f(counter_width, text_height, 1)
+                counter_model = Matrix4x4f.create_translation_rotation_scale(counter_pos, quad_rot, counter_scale)
+                
+                counter_mvp = vp @ counter_model
+                glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, counter_mvp.as_numpy())
+                
+                glBindTexture(GL_TEXTURE_2D, self.counter_texture)
+                glDrawArrays(GL_TRIANGLES, 0, 6)
             
             current_label_offset -= 0.005 * label_scale_factor  # Отступ между названием и расстоянием
         
@@ -1804,6 +1878,7 @@ class VRStereoViewer:
         if self.images and len(self.images) > 1:
             self.current_index = (self.current_index + 1) % len(self.images)
             self.ensure_current_texture()
+            self.update_counter_texture()
             self._preload_nearby()
             
     def prev_image(self):
@@ -1811,6 +1886,7 @@ class VRStereoViewer:
         if self.images and len(self.images) > 1:
             self.current_index = (self.current_index - 1) % len(self.images)
             self.ensure_current_texture()
+            self.update_counter_texture()
             self._preload_nearby()
     
     def delete_current_image(self):
@@ -1858,8 +1934,10 @@ class VRStereoViewer:
             if self.images:
                 if self.current_index >= len(self.images):
                     self.current_index = len(self.images) - 1
+                self.update_counter_texture()
             else:
                 log.info("Все изображения удалены")
+                self.update_counter_texture()
                 
         except Exception as e:
             log.error(f"Ошибка удаления: {e}")
@@ -1921,6 +1999,7 @@ class VRStereoViewer:
         # Загружаем текущее изображение
         if self.images:
             self.ensure_current_texture()
+            self.update_counter_texture()
     
     def add_images_from_paths(self, paths: List[str], replace: bool = False):
         """
@@ -2075,6 +2154,7 @@ class VRStereoViewer:
                         self.cross_eyed_mode = not self.cross_eyed_mode
                         mode_name = "Cross-eyed" if self.cross_eyed_mode else "Parallel"
                         log.info(f"Режим просмотра: {mode_name}")
+                        self.update_distance_texture()
                     elif key == glfw.KEY_HOME:
                         # Сброс смещения изображения
                         self.image_offset_x = 0.0
@@ -2211,6 +2291,10 @@ class VRStereoViewer:
             # Удаляем текстуры
             for img in self.images:
                 img.delete_textures()
+            if self.distance_texture:
+                glDeleteTextures(1, [self.distance_texture])
+            if self.counter_texture:
+                glDeleteTextures(1, [self.counter_texture])
             log.debug("  ✓ Текстуры удалены")
             
             # Удаляем OpenGL объекты
