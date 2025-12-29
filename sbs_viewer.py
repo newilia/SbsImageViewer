@@ -302,6 +302,9 @@ class VRStereoViewer:
         self.shader_program: Optional[int] = None
         self.quad_vao: Optional[int] = None
         self.quad_vbo: Optional[int] = None
+        self.line_vao: Optional[int] = None  # VAO для луча
+        self.line_vbo: Optional[int] = None  # VBO для луча
+        self.circle_texture: Optional[int] = None  # Текстура круга для указателя
         self.window = None
         
         # Состояние
@@ -355,10 +358,47 @@ class VRStereoViewer:
         self.folder_check_interval: float = 2.0  # Интервал проверки (секунды)
         self.cross_eyed_mode: bool = settings.get("cross_eyed", False)  # Режим просмотра: False = parallel, True = cross-eyed
         self.ipd_offset: float = settings.get("ipd_offset", 0.0)  # Смещение IPD (межзрачковое расстояние), в метрах
-        self.ipd_step: float = 0.04  # Шаг изменения IPD (40 мм)
+        self.ipd_step: float = 0.01  # Шаг изменения IPD (10 мм)
+        
+        # Указатель контроллера для калибровки IPD
+        self.pointer_uv: Optional[Tuple[float, float]] = None  # UV координаты на изображении (0-1)
+        self.pointer_active: bool = False  # Указатель активен (контроллер направлен на изображение)
+        self.controller_ray_origin: Optional[Tuple[float, float, float]] = None  # Начало луча
+        self.controller_ray_dir: Optional[Tuple[float, float, float]] = None  # Направление луча
         
         mode_name = "Cross-eyed" if self.cross_eyed_mode else "Parallel"
         log.info(f"Загружены настройки: масштаб={self.quad_scale:.2f}, IPD={self.ipd_offset * 1000:+.1f}мм, режим={mode_name}")
+    
+    def calc_ray_plane_intersection(self, ray_origin, ray_dir, plane_z, quad_center, quad_half_size):
+        """
+        Вычисляет пересечение луча с плоскостью изображения.
+        Возвращает UV координаты (0-1) или None если нет пересечения.
+        """
+        # Плоскость Z = plane_z
+        if abs(ray_dir[2]) < 0.0001:
+            return None  # Луч параллелен плоскости
+        
+        # t = (plane_z - origin_z) / dir_z
+        t = (plane_z - ray_origin[2]) / ray_dir[2]
+        if t < 0:
+            return None  # Плоскость позади луча
+        
+        # Точка пересечения
+        hit_x = ray_origin[0] + ray_dir[0] * t
+        hit_y = ray_origin[1] + ray_dir[1] * t
+        
+        # Проверяем попадание в прямоугольник изображения
+        rel_x = hit_x - quad_center[0]
+        rel_y = hit_y - quad_center[1]
+        
+        if abs(rel_x) > quad_half_size[0] or abs(rel_y) > quad_half_size[1]:
+            return None  # Мимо изображения
+        
+        # Конвертируем в UV (0-1)
+        u = (rel_x / quad_half_size[0] + 1.0) / 2.0
+        v = 1.0 - (rel_y / quad_half_size[1] + 1.0) / 2.0  # Инвертируем Y
+        
+        return (u, v)
         
     def load_images(self):
         """Подготовка списка изображений (ленивая загрузка)"""
@@ -1217,6 +1257,103 @@ class VRStereoViewer:
             # Сброс флага reset когда отпустили
             if not any(grip_values[i] > 0.5 and trigger_values[i] > 0.5 for i in [0, 1]):
                 self._reset_held = False
+            
+            # === Отслеживание указателя правого контроллера для калибровки IPD ===
+            pointer_hand = 1  # Правый контроллер
+            self.pointer_active = False
+            self.pointer_uv = None
+            
+            if self.hand_spaces[pointer_hand] is not None:
+                try:
+                    space_location = xr.locate_space(
+                        space=self.hand_spaces[pointer_hand],
+                        base_space=self.local_space,
+                        time=self.predicted_display_time,
+                    )
+                    
+                    flags = space_location.location_flags
+                    if (flags & xr.SPACE_LOCATION_POSITION_VALID_BIT) and (flags & xr.SPACE_LOCATION_ORIENTATION_VALID_BIT):
+                        pos = space_location.pose.position
+                        q = space_location.pose.orientation
+                        
+                        # Сохраняем позицию контроллера
+                        self.controller_ray_origin = (pos.x, pos.y, pos.z)
+                        
+                        # Вычисляем направление луча из кватерниона (вперёд = -Z в локальных координатах)
+                        qx, qy, qz, qw = q.x, q.y, q.z, q.w
+                        
+                        # Вращение вектора кватернионом контроллера
+                        # Исходный вектор: направление "вперёд и вниз на 60°" в локальных координатах контроллера
+                        import math
+                        angle = math.radians(-60)
+                        vx, vy, vz = 0.0, math.sin(angle), -math.cos(angle)
+                        
+                        # Вращение вектора (vx, vy, vz) кватернионом q
+                        # Формула: v' = q * v * q^(-1)
+                        # Матричная форма:
+                        dir_x = (1 - 2*qy*qy - 2*qz*qz)*vx + 2*(qx*qy - qw*qz)*vy + 2*(qx*qz + qw*qy)*vz
+                        dir_y = 2*(qx*qy + qw*qz)*vx + (1 - 2*qx*qx - 2*qz*qz)*vy + 2*(qy*qz - qw*qx)*vz
+                        dir_z = 2*(qx*qz - qw*qy)*vx + 2*(qy*qz + qw*qx)*vy + (1 - 2*qx*qx - 2*qy*qy)*vz
+                        
+                        self.controller_ray_dir = (dir_x, dir_y, dir_z)
+                        
+                        # Отладка (раз в секунду)
+                        if not hasattr(self, '_last_debug_time'):
+                            self._last_debug_time = 0
+                        now = time.time()
+                        if now - self._last_debug_time > 1.0:
+                            self._last_debug_time = now
+                            log.info(f"Controller: pos=({pos.x:.2f}, {pos.y:.2f}, {pos.z:.2f}), dir=({dir_x:.2f}, {dir_y:.2f}, {dir_z:.2f})")
+                        
+                        # Вычисляем параметры изображения
+                        if self.images and 0 <= self.current_index < len(self.images):
+                            current_image = self.images[self.current_index]
+                            if current_image._loaded:
+                                eye_height = self.head_height if self.head_height else 1.6
+                                quad_center = (
+                                    self.image_offset_x,
+                                    eye_height + self.image_offset_y,
+                                    -self.quad_distance
+                                )
+                                
+                                # Физический размер как в render_eye
+                                # aspect_ratio = left.shape[1] / left.shape[0] (уже для половины SBS)
+                                img_height, img_width = current_image.left.shape[:2]
+                                aspect = img_width / img_height
+                                physical_scale = self.base_size * self.quad_scale * self.quad_distance
+                                # Квад рисуется с масштабом (physical_scale * aspect, physical_scale)
+                                # Вершины квада от -0.5 до 0.5, значит half_size = масштаб / 2
+                                quad_half_w = physical_scale * aspect / 2
+                                quad_half_h = physical_scale / 2
+                                quad_half_size = (quad_half_w, quad_half_h)
+                                
+                                # Вычисляем пересечение
+                                uv = self.calc_ray_plane_intersection(
+                                    self.controller_ray_origin,
+                                    self.controller_ray_dir,
+                                    -self.quad_distance,
+                                    quad_center,
+                                    quad_half_size
+                                )
+                                
+                                if uv is not None:
+                                    self.pointer_active = True
+                                    self.pointer_uv = uv
+                                    
+                                    # Проверяем нажатие курка для калибровки
+                                    if trigger_values[pointer_hand] > 0.8:
+                                        if not hasattr(self, '_trigger_was_pressed'):
+                                            self._trigger_was_pressed = False
+                                        if not self._trigger_was_pressed:
+                                            self._trigger_was_pressed = True
+                                            log.info(f"🎯 Курок нажат! UV=({uv[0]:.2f}, {uv[1]:.2f})")
+                                            # Запускаем калибровку по выбранной области
+                                            self.auto_calibrate_ipd_at_point(uv[0], uv[1])
+                                    else:
+                                        self._trigger_was_pressed = False
+                                        
+                except Exception as e:
+                    log.warning(f"Pointer tracking error: {e}")
                 
         except Exception as e:
             # Логируем ошибки контроллеров
@@ -1364,6 +1501,48 @@ class VRStereoViewer:
         glVertexAttribPointer(self.vertex_uv_loc, 2, GL_FLOAT, GL_FALSE, 5 * 4, ctypes.c_void_p(3 * 4))
         
         glBindVertexArray(0)
+        
+        # Создаём VAO для линии (луча контроллера)
+        self.line_vao = glGenVertexArrays(1)
+        self.line_vbo = glGenBuffers(1)
+        
+        glBindVertexArray(self.line_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+        # Резервируем место для 2 вершин (начало и конец луча)
+        glBufferData(GL_ARRAY_BUFFER, 6 * 4, None, GL_DYNAMIC_DRAW)  # 2 вершины * 3 координаты * 4 байта
+        
+        glEnableVertexAttribArray(self.vertex_pos_loc)
+        glVertexAttribPointer(self.vertex_pos_loc, 3, GL_FLOAT, GL_FALSE, 3 * 4, ctypes.c_void_p(0))
+        
+        glBindVertexArray(0)
+        
+        # Создаём текстуру круга для указателя
+        self._create_circle_texture()
+        
+    def _create_circle_texture(self):
+        """Создание текстуры белого круга с прозрачным фоном"""
+        from PIL import ImageDraw
+        
+        size = 128
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        
+        # Рисуем белый круг с полупрозрачной заливкой и контуром
+        margin = 4
+        draw.ellipse([margin, margin, size - margin, size - margin], 
+                     fill=(255, 255, 255, 100), outline=(255, 255, 255, 255), width=3)
+        
+        # Создаём текстуру
+        self.circle_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.circle_texture)
+        
+        img_data = np.array(img, dtype=np.uint8)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+        
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
         
     def create_textures(self):
         """Создание текстур (только для текущего изображения)"""
@@ -1687,6 +1866,84 @@ class VRStereoViewer:
             glBindTexture(GL_TEXTURE_2D, self.distance_texture)
             glDrawArrays(GL_TRIANGLES, 0, 6)
         
+        # === РЕНДЕРИНГ УКАЗАТЕЛЯ КОНТРОЛЛЕРА ===
+        if self.pointer_active and self.pointer_uv is not None and self.circle_texture:
+            # Размеры изображения
+            quad_full_w = physical_scale * aspect_ratio  # Полная ширина
+            quad_full_h = physical_scale  # Полная высота
+            
+            # Размер круга = 5% от (ширина + высота) изображения
+            circle_size = 0.05 * (quad_full_w + quad_full_h)
+            
+            # Позиция круга на изображении
+            # UV: (0,0) = верхний левый, (1,1) = нижний правый
+            u, v = self.pointer_uv
+            
+            # Центр изображения
+            center_x = self.image_offset_x
+            center_y = eye_height + self.image_offset_y
+            
+            # Позиция точки (UV 0-1 -> мировые координаты)
+            # U=0 -> левый край (-quad_full_w/2), U=1 -> правый край (+quad_full_w/2)
+            # V=0 -> верхний край (+quad_full_h/2), V=1 -> нижний край (-quad_full_h/2)
+            point_x = center_x + (u - 0.5) * quad_full_w
+            point_y = center_y + (0.5 - v) * quad_full_h
+            point_z = -self.quad_distance + 0.02  # Чуть ближе к камере
+            
+            circle_pos = xr.Vector3f(point_x, point_y, point_z)
+            circle_scale = xr.Vector3f(circle_size, circle_size, 1)
+            circle_model = Matrix4x4f.create_translation_rotation_scale(circle_pos, quad_rot, circle_scale)
+            
+            circle_mvp = vp @ circle_model
+            glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, circle_mvp.as_numpy())
+            
+            glBindTexture(GL_TEXTURE_2D, self.circle_texture)
+            glDrawArrays(GL_TRIANGLES, 0, 6)
+        
+        # === РЕНДЕРИНГ ЛУЧА КОНТРОЛЛЕРА ===
+        if self.controller_ray_origin and self.controller_ray_dir:
+            # Рисуем линию от контроллера вперёд
+            ray_origin = self.controller_ray_origin
+            
+            # Конечная точка: либо на плоскости изображения, либо на фиксированном расстоянии
+            if abs(self.controller_ray_dir[2]) > 0.001:
+                t = (-self.quad_distance - ray_origin[2]) / self.controller_ray_dir[2]
+                if t < 0:
+                    t = 10.0  # Луч направлен от изображения
+            else:
+                t = 10.0  # Луч параллелен плоскости
+            
+            ray_end = (
+                ray_origin[0] + self.controller_ray_dir[0] * t,
+                ray_origin[1] + self.controller_ray_dir[1] * t,
+                ray_origin[2] + self.controller_ray_dir[2] * t
+            )
+            
+            # Обновляем VBO линии
+            line_vertices = np.array([
+                ray_origin[0], ray_origin[1], ray_origin[2],
+                ray_end[0], ray_end[1], ray_end[2]
+            ], dtype=np.float32)
+            
+            glBindBuffer(GL_ARRAY_BUFFER, self.line_vbo)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, line_vertices.nbytes, line_vertices)
+            
+            # Рисуем линию без текстуры
+            glUniform1i(use_tex_loc, 0)  # Отключаем текстуру
+            
+            # MVP для линии (без трансформации модели)
+            line_mvp = vp
+            glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, line_mvp.as_numpy())
+            
+            # Рисуем линию
+            glBindVertexArray(self.line_vao)
+            glLineWidth(2.0)
+            glDrawArrays(GL_LINES, 0, 2)
+            glBindVertexArray(self.quad_vao)
+            
+            # Восстанавливаем текстуру
+            glUniform1i(use_tex_loc, 1)
+        
         glDisable(GL_BLEND)
         
         glBindVertexArray(0)
@@ -1880,6 +2137,268 @@ class VRStereoViewer:
                 json.dump(settings, f, indent=2)
         except Exception as e:
             log.debug(f"Не удалось сохранить настройки: {e}")
+    
+    def auto_calibrate_ipd(self):
+        """Автоматическая калибровка IPD с использованием тернарного поиска"""
+        if not self.images:
+            log.warning("Нет изображений для калибровки IPD")
+            return
+        
+        log.info("🔍 Запуск автокалибровки IPD...")
+        
+        current_image = self.images[self.current_index]
+        
+        # Убеждаемся что изображение загружено
+        if not hasattr(current_image, '_loaded') or not current_image._loaded:
+            self._load_image_data(self.current_index)
+        
+        left = current_image.left
+        right = current_image.right
+        
+        if left.size == 0 or right.size == 0:
+            log.warning("Изображение не загружено")
+            return
+        
+        # Уменьшаем изображения для ускорения (в 4 раза)
+        scale_factor = 4
+        h, w = left.shape[:2]
+        small_h, small_w = h // scale_factor, w // scale_factor
+        
+        # Быстрое уменьшение через срезы
+        left_small = left[::scale_factor, ::scale_factor, :3]
+        right_small = right[::scale_factor, ::scale_factor, :3]
+        
+        # Конвертируем в grayscale
+        left_gray = np.mean(left_small, axis=2).astype(np.float32)
+        right_gray = np.mean(right_small, axis=2).astype(np.float32)
+        
+        # Вычисляем точность в пикселях (10 мм)
+        img_height, img_width = left.shape[:2]
+        aspect_ratio = img_width / img_height
+        physical_width = self.base_size * self.quad_scale * self.quad_distance * aspect_ratio
+        pixel_to_meter = physical_width / img_width
+        
+        # 10 мм в пикселях уменьшенного изображения
+        precision_pixels = max(1, int(0.01 / pixel_to_meter / scale_factor))
+        
+        # Максимальный сдвиг (15% ширины уменьшенного изображения)
+        max_shift = small_w // 7
+        
+        # Тернарный поиск минимума
+        lo = -max_shift
+        hi = max_shift
+        
+        iterations = 0
+        while hi - lo > precision_pixels and iterations < 20:
+            mid1 = lo + (hi - lo) // 3
+            mid2 = hi - (hi - lo) // 3
+            
+            diff1 = self._calc_overlap_diff(left_gray, right_gray, mid1)
+            diff2 = self._calc_overlap_diff(left_gray, right_gray, mid2)
+            
+            if diff1 < diff2:
+                hi = mid2
+            else:
+                lo = mid1
+            
+            iterations += 1
+        
+        # Результат в пикселях уменьшенного изображения
+        best_shift_small = (lo + hi) // 2
+        
+        # Конвертируем обратно в оригинальный масштаб и в метры
+        # Знак инвертируем: положительный сдвиг при сравнении = изображения нужно сблизить = отрицательный IPD
+        best_shift = best_shift_small * scale_factor
+        new_ipd = -best_shift * pixel_to_meter
+        
+        log.info(f"✓ Автокалибровка за {iterations} итераций: сдвиг={best_shift}px, IPD={new_ipd * 1000:+.1f}мм")
+        
+        self.ipd_offset = new_ipd
+        self.update_distance_texture()
+        self.save_settings()
+    
+    def _calc_overlap_diff(self, left: np.ndarray, right: np.ndarray, shift: int) -> float:
+        """Вычисление средней разницы по краям изображения (фон) при заданном сдвиге"""
+        height, width = left.shape
+        
+        # Размеры краевых областей (20% от размера)
+        edge_h = max(1, height // 5)  # Верхний край
+        edge_w = max(1, width // 5)   # Левый и правый края
+        
+        if shift == 0:
+            left_crop = left
+            right_crop = right
+        elif shift > 0:
+            left_crop = left[:, shift:]
+            right_crop = right[:, :width - shift]
+        else:
+            shift = -shift
+            left_crop = left[:, :width - shift]
+            right_crop = right[:, shift:]
+        
+        overlap_width = left_crop.shape[1]
+        if overlap_width <= edge_w * 2:
+            return float('inf')
+        
+        # Собираем разницу только по краям (верх, лево, право)
+        total_diff = 0.0
+        total_pixels = 0
+        
+        # Верхний край (вся ширина, 20% высоты)
+        top_left = left_crop[:edge_h, :]
+        top_right = right_crop[:edge_h, :]
+        total_diff += np.sum(np.abs(top_left - top_right))
+        total_pixels += top_left.size
+        
+        # Левый край (20% ширины, вся высота кроме верха)
+        left_edge_left = left_crop[edge_h:, :edge_w]
+        left_edge_right = right_crop[edge_h:, :edge_w]
+        total_diff += np.sum(np.abs(left_edge_left - left_edge_right))
+        total_pixels += left_edge_left.size
+        
+        # Правый край (20% ширины, вся высота кроме верха)
+        right_edge_left = left_crop[edge_h:, -edge_w:]
+        right_edge_right = right_crop[edge_h:, -edge_w:]
+        total_diff += np.sum(np.abs(right_edge_left - right_edge_right))
+        total_pixels += right_edge_left.size
+        
+        if total_pixels == 0:
+            return float('inf')
+        
+        return total_diff / total_pixels
+    
+    def auto_calibrate_ipd_at_point(self, u: float, v: float):
+        """
+        Автоматическая калибровка IPD по области вокруг указанной точки.
+        Берём патч из левого изображения и ищем его в правом изображении.
+        u, v - нормализованные координаты (0-1) на изображении
+        """
+        if not self.images:
+            log.warning("Нет изображений для калибровки IPD")
+            return
+        
+        log.info(f"🎯 Калибровка IPD по точке ({u:.2f}, {v:.2f})...")
+        
+        current_image = self.images[self.current_index]
+        
+        # Убеждаемся что изображение загружено
+        if not hasattr(current_image, '_loaded') or not current_image._loaded:
+            self._load_image_data(self.current_index)
+        
+        left = current_image.left
+        right = current_image.right
+        
+        if left.size == 0 or right.size == 0:
+            log.warning("Изображение не загружено")
+            return
+        
+        h, w = left.shape[:2]
+        
+        # Радиус области = 5% от (ширина + высота)
+        radius = int(0.05 * (w + h) / 2)
+        
+        # Центр области в пикселях
+        cx = int(u * w)
+        cy = int(v * h)
+        
+        # Границы патча из левого изображения
+        patch_x1 = max(0, cx - radius)
+        patch_x2 = min(w, cx + radius)
+        patch_y1 = max(0, cy - radius)
+        patch_y2 = min(h, cy + radius)
+        
+        if patch_x2 - patch_x1 < 10 or patch_y2 - patch_y1 < 10:
+            log.warning("Область слишком мала для калибровки")
+            return
+        
+        # Вырезаем патч из левого изображения
+        left_patch = left[patch_y1:patch_y2, patch_x1:patch_x2, :3]
+        left_gray = np.mean(left_patch, axis=2).astype(np.float32)
+        
+        # Конвертируем правое изображение в grayscale (только нужная полоса по Y)
+        right_strip = right[patch_y1:patch_y2, :, :3]
+        right_gray = np.mean(right_strip, axis=2).astype(np.float32)
+        
+        patch_w = patch_x2 - patch_x1
+        
+        # Вычисляем конверсию пиксели -> метры
+        aspect_ratio = w / h
+        physical_width = self.base_size * self.quad_scale * self.quad_distance * aspect_ratio
+        pixel_to_meter = physical_width / w
+        
+        # Максимальный сдвиг поиска (20% ширины изображения в каждую сторону)
+        max_shift = w // 5
+        
+        # Диапазон поиска в правом изображении
+        search_start = max(0, patch_x1 - max_shift)
+        search_end = min(w - patch_w, patch_x1 + max_shift)
+        
+        if search_end <= search_start:
+            log.warning("Недостаточно места для поиска")
+            return
+        
+        # Ищем минимум разницы
+        best_shift = 0
+        best_diff = float('inf')
+        
+        # Грубый поиск с шагом 4 пикселя
+        step = 4
+        for x in range(search_start, search_end, step):
+            right_patch = right_gray[:, x:x + patch_w]
+            if right_patch.shape[1] != patch_w:
+                continue
+            diff = np.mean(np.abs(left_gray - right_patch))
+            if diff < best_diff:
+                best_diff = diff
+                best_shift = x - patch_x1
+        
+        # Точный поиск вокруг лучшего результата
+        fine_start = max(search_start, patch_x1 + best_shift - step)
+        fine_end = min(search_end, patch_x1 + best_shift + step)
+        
+        for x in range(fine_start, fine_end + 1):
+            right_patch = right_gray[:, x:x + patch_w]
+            if right_patch.shape[1] != patch_w:
+                continue
+            diff = np.mean(np.abs(left_gray - right_patch))
+            if diff < best_diff:
+                best_diff = diff
+                best_shift = x - patch_x1
+        
+        # Конвертируем сдвиг в метры
+        # Если патч в правом изображении левее (shift < 0), нужно сблизить изображения (IPD < 0)
+        # Если патч в правом изображении правее (shift > 0), нужно раздвинуть изображения (IPD > 0)
+        new_ipd = best_shift * pixel_to_meter
+        
+        log.info(f"✓ Калибровка: сдвиг={best_shift}px, IPD={new_ipd * 1000:+.1f}мм")
+        
+        self.ipd_offset = new_ipd
+        self.update_distance_texture()
+        self.save_settings()
+    
+    def _calc_region_diff(self, left: np.ndarray, right: np.ndarray, shift: int) -> float:
+        """Вычисление средней разницы между двумя областями при заданном сдвиге"""
+        height, width = left.shape
+        
+        if shift == 0:
+            left_crop = left
+            right_crop = right
+        elif shift > 0:
+            if shift >= width:
+                return float('inf')
+            left_crop = left[:, shift:]
+            right_crop = right[:, :width - shift]
+        else:
+            shift = -shift
+            if shift >= width:
+                return float('inf')
+            left_crop = left[:, :width - shift]
+            right_crop = right[:, shift:]
+        
+        if left_crop.size == 0:
+            return float('inf')
+        
+        return np.mean(np.abs(left_crop - right_crop))
     
     def next_image(self):
         """Переход к следующему изображению"""
@@ -2117,7 +2636,7 @@ class VRStereoViewer:
             log.info("  O - открыть файлы | F - открыть папку")
             log.info("  ←/→ или E/Q - переключение изображений")
             log.info("  +/- или D/A - масштаб")
-            log.info("  W/S или 1/3 - IPD ±40мм | 2 - сброс IPD")
+            log.info("  W/S или 1/3 - IPD ±40мм | 2 - сброс | X - авто")
             log.info("  C - cross-eyed/parallel | Home - сброс смещения")
             log.info("  Delete - удалить фото | ESC - выход")
             log.info("")
@@ -2187,6 +2706,9 @@ class VRStereoViewer:
                         log.info(f"IPD: {self.ipd_offset * 1000:+.1f} мм")
                         self.update_distance_texture()
                         self.save_settings()
+                    elif key == glfw.KEY_X:
+                        # Автокалибровка IPD
+                        self.auto_calibrate_ipd()
                     elif key == glfw.KEY_HOME:
                         # Сброс смещения изображения
                         self.image_offset_x = 0.0
@@ -2327,6 +2849,8 @@ class VRStereoViewer:
                 glDeleteTextures(1, [self.distance_texture])
             if self.counter_texture:
                 glDeleteTextures(1, [self.counter_texture])
+            if self.circle_texture:
+                glDeleteTextures(1, [self.circle_texture])
             log.debug("  ✓ Текстуры удалены")
             
             # Удаляем OpenGL объекты
@@ -2334,6 +2858,10 @@ class VRStereoViewer:
                 glDeleteVertexArrays(1, [self.quad_vao])
             if self.quad_vbo:
                 glDeleteBuffers(1, [self.quad_vbo])
+            if self.line_vao:
+                glDeleteVertexArrays(1, [self.line_vao])
+            if self.line_vbo:
+                glDeleteBuffers(1, [self.line_vbo])
             if self.shader_program:
                 glDeleteProgram(self.shader_program)
             log.debug("  ✓ OpenGL объекты удалены")
