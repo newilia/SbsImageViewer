@@ -342,7 +342,7 @@ class VRStereoViewer:
         
         # Параметры отображения (загружаем из конфига)
         settings = self.load_settings()
-        self.quad_distance = settings.get("distance", 2.0)
+        self.quad_distance = settings.get("distance", 10.0)
         self.quad_scale = settings.get("scale", 1.0)
         self.base_size = 1.0  # Базовый физический размер при расстоянии 1м
         self.distance_texture: Optional[int] = None
@@ -353,9 +353,12 @@ class VRStereoViewer:
         self.watch_folder: Optional[str] = None  # Папка для мониторинга
         self.last_folder_check: float = 0  # Время последней проверки папки
         self.folder_check_interval: float = 2.0  # Интервал проверки (секунды)
-        self.cross_eyed_mode: bool = False  # Режим просмотра: False = parallel, True = cross-eyed
+        self.cross_eyed_mode: bool = settings.get("cross_eyed", False)  # Режим просмотра: False = parallel, True = cross-eyed
+        self.ipd_offset: float = settings.get("ipd_offset", 0.0)  # Смещение IPD (межзрачковое расстояние), в метрах
+        self.ipd_step: float = 0.04  # Шаг изменения IPD (40 мм)
         
-        log.info(f"Загружены настройки: расстояние={self.quad_distance:.1f}м, масштаб={self.quad_scale:.2f}")
+        mode_name = "Cross-eyed" if self.cross_eyed_mode else "Parallel"
+        log.info(f"Загружены настройки: масштаб={self.quad_scale:.2f}, IPD={self.ipd_offset * 1000:+.1f}мм, режим={mode_name}")
         
     def load_images(self):
         """Подготовка списка изображений (ленивая загрузка)"""
@@ -968,7 +971,7 @@ class VRStereoViewer:
             
             log.info("=" * 50)
             log.info("Управление контроллерами:")
-            log.info("  Стики ↑↓ - расстояние | ←→ - масштаб")
+            log.info("  Стики ↑↓ - IPD | ←→ - масштаб")
             log.info("  A/X - следующее | B/Y - предыдущее")
             log.info("  Grip + вращение запястья - смещение изображения")
             log.info("  Trigger + Grip - сброс смещения | Menu - выход")
@@ -1003,7 +1006,7 @@ class VRStereoViewer:
             # === Обработка thumbstick с толерантностью к отклонениям ===
             # Считываем оба значения (X и Y) для каждого контроллера
             # и активируем только доминирующую ось
-            distance_changed = False
+            ipd_changed = False
             scale_changed = False
             
             for hand_idx in [0, 1]:  # left, right
@@ -1033,12 +1036,12 @@ class VRStereoViewer:
                 # Коэффициент 1.5 означает, что доминирующая ось должна быть в 1.5 раза больше
                 dominance_ratio = 1.5
                 
-                # Y ось (расстояние) - активируем только если Y доминирует
-                # Экспоненциальное изменение: чем дальше, тем быстрее меняется
+                # Y ось (IPD) - активируем только если Y доминирует
+                # Линейное изменение IPD
                 if abs_y > self.thumbstick_deadzone and abs_y > abs_x * dominance_ratio:
-                    factor = 1.0 + (y_val * self.thumbstick_speed_distance * 0.016)  # ~60fps
-                    self.quad_distance = max(0.3, min(50.0, self.quad_distance * factor))
-                    distance_changed = True
+                    ipd_delta = y_val * self.ipd_step * 0.5  # Плавное изменение
+                    self.ipd_offset += ipd_delta
+                    ipd_changed = True
                 
                 # X ось (масштаб) - активируем только если X доминирует
                 if abs_x > self.thumbstick_deadzone and abs_x > abs_y * dominance_ratio:
@@ -1046,7 +1049,7 @@ class VRStereoViewer:
                     self.quad_scale = max(0.1, min(5.0, self.quad_scale * scale_delta))
                     scale_changed = True
             
-            if distance_changed:
+            if ipd_changed:
                 self.update_distance_texture()
                 self.save_settings()
             
@@ -1390,9 +1393,10 @@ class VRStereoViewer:
         if self.distance_texture:
             glDeleteTextures(1, [self.distance_texture])
         
-        # Текст с расстоянием и режимом
+        # Текст с режимом и IPD
         mode_name = "Cross" if self.cross_eyed_mode else "Parallel"
-        text = f"{self.quad_distance:.1f} м | {mode_name}"
+        ipd_mm = self.ipd_offset * 1000  # Конвертируем в миллиметры
+        text = f"{mode_name} | IPD: {ipd_mm:+.1f} мм"
         
         try:
             font = ImageFont.truetype("arial.ttf", 36)
@@ -1570,7 +1574,9 @@ class VRStereoViewer:
         eye_height = self.head_height
         
         # Позиция с учётом смещения (без вращения - оно в view matrix)
-        quad_pos = xr.Vector3f(self.image_offset_x, eye_height + self.image_offset_y, -self.quad_distance)
+        # IPD: левый глаз (view_index=0) смещаем влево, правый (view_index=1) вправо
+        ipd_shift = self.ipd_offset / 2 * (-1 if view_index == 0 else 1)
+        quad_pos = xr.Vector3f(self.image_offset_x + ipd_shift, eye_height + self.image_offset_y, -self.quad_distance)
         
         # Ориентация: изображение смотрит на пользователя (без вращения)
         quad_rot = xr.Quaternionf(0, 0, 0, 1)
@@ -1866,7 +1872,9 @@ class VRStereoViewer:
         try:
             settings = {
                 "distance": self.quad_distance,
-                "scale": self.quad_scale
+                "scale": self.quad_scale,
+                "ipd_offset": self.ipd_offset,
+                "cross_eyed": self.cross_eyed_mode
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2)
@@ -2108,12 +2116,13 @@ class VRStereoViewer:
             log.info("  Перетащите файлы на окно для загрузки")
             log.info("  O - открыть файлы | F - открыть папку")
             log.info("  ←/→ или E/Q - переключение изображений")
-            log.info("  +/- или D/A - масштаб | W/S - расстояние")
+            log.info("  +/- или D/A - масштаб")
+            log.info("  W/S или 1/3 - IPD ±40мм | 2 - сброс IPD")
             log.info("  C - cross-eyed/parallel | Home - сброс смещения")
             log.info("  Delete - удалить фото | ESC - выход")
             log.info("")
             log.info("Управление контроллерами Meta Quest 3:")
-            log.info("  Стики ↑↓ - расстояние | ←→ - масштаб")
+            log.info("  Стики ↑↓ - IPD | ←→ - масштаб")
             log.info("  Grip + вращение запястья - смещение изображения")
             log.info("  A/X - след. | B/Y - пред. | Menu - выход")
             log.info("  Trigger + Grip - сброс смещения")
@@ -2140,11 +2149,15 @@ class VRStereoViewer:
                         self.quad_scale = max(0.1, self.quad_scale / 1.1)
                         self.save_settings()
                     elif key == glfw.KEY_W:
-                        self.quad_distance = min(50.0, self.quad_distance * 1.15)
+                        # Увеличить IPD (изображения расходятся) - то же что клавиша 3
+                        self.ipd_offset += self.ipd_step
+                        log.info(f"IPD: {self.ipd_offset * 1000:+.1f} мм")
                         self.update_distance_texture()
                         self.save_settings()
                     elif key == glfw.KEY_S:
-                        self.quad_distance = max(0.3, self.quad_distance / 1.15)
+                        # Уменьшить IPD (изображения сходятся) - то же что клавиша 1
+                        self.ipd_offset -= self.ipd_step
+                        log.info(f"IPD: {self.ipd_offset * 1000:+.1f} мм")
                         self.update_distance_texture()
                         self.save_settings()
                     elif key == glfw.KEY_R:
@@ -2155,6 +2168,25 @@ class VRStereoViewer:
                         mode_name = "Cross-eyed" if self.cross_eyed_mode else "Parallel"
                         log.info(f"Режим просмотра: {mode_name}")
                         self.update_distance_texture()
+                        self.save_settings()
+                    elif key == glfw.KEY_1 or key == glfw.KEY_KP_1:
+                        # Уменьшить IPD (изображения сходятся)
+                        self.ipd_offset -= self.ipd_step
+                        log.info(f"IPD: {self.ipd_offset * 1000:+.1f} мм")
+                        self.update_distance_texture()
+                        self.save_settings()
+                    elif key == glfw.KEY_2 or key == glfw.KEY_KP_2:
+                        # Сброс IPD
+                        self.ipd_offset = 0.0
+                        log.info("IPD сброшен в 0")
+                        self.update_distance_texture()
+                        self.save_settings()
+                    elif key == glfw.KEY_3 or key == glfw.KEY_KP_3:
+                        # Увеличить IPD (изображения расходятся)
+                        self.ipd_offset += self.ipd_step
+                        log.info(f"IPD: {self.ipd_offset * 1000:+.1f} мм")
+                        self.update_distance_texture()
+                        self.save_settings()
                     elif key == glfw.KEY_HOME:
                         # Сброс смещения изображения
                         self.image_offset_x = 0.0
